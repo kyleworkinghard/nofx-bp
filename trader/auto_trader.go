@@ -39,6 +39,10 @@ type AutoTraderConfig struct {
 	AsterSigner     string // Aster API钱包地址
 	AsterPrivateKey string // Aster API钱包私钥
 
+	// Backpack配置
+	BackpackAPIKey     string // Backpack API Key
+	BackpackPrivateKey string // Backpack ED25519私钥 (base64编码)
+
 	CoinPoolAPIURL string
 
 	// AI配置
@@ -190,6 +194,12 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		trader, err = NewAsterTrader(config.AsterUser, config.AsterSigner, config.AsterPrivateKey)
 		if err != nil {
 			return nil, fmt.Errorf("初始化Aster交易器失败: %w", err)
+		}
+	case "backpack":
+		log.Printf("🏦 [%s] 使用Backpack交易", config.Name)
+		trader, err = NewBackpackTrader(config.BackpackAPIKey, config.BackpackPrivateKey, userID)
+		if err != nil {
+			return nil, fmt.Errorf("初始化Backpack交易器失败: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("不支持的交易平台: %s", config.Exchange)

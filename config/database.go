@@ -244,6 +244,8 @@ func (d *Database) createTables() error {
 		`ALTER TABLE exchanges ADD COLUMN aster_user TEXT DEFAULT ''`,
 		`ALTER TABLE exchanges ADD COLUMN aster_signer TEXT DEFAULT ''`,
 		`ALTER TABLE exchanges ADD COLUMN aster_private_key TEXT DEFAULT ''`,
+		`ALTER TABLE exchanges ADD COLUMN backpack_api_key TEXT DEFAULT ''`,
+		`ALTER TABLE exchanges ADD COLUMN backpack_private_key TEXT DEFAULT ''`,
 		`ALTER TABLE traders ADD COLUMN custom_prompt TEXT DEFAULT ''`,
 		`ALTER TABLE traders ADD COLUMN override_base_prompt BOOLEAN DEFAULT 0`,
 		`ALTER TABLE traders ADD COLUMN is_cross_margin BOOLEAN DEFAULT 1`,             // 默认为全仓模式
@@ -300,6 +302,7 @@ func (d *Database) initDefaultData() error {
 		{"binance", "Binance Futures", "binance"},
 		{"hyperliquid", "Hyperliquid", "hyperliquid"},
 		{"aster", "Aster DEX", "aster"},
+		{"backpack", "Backpack Exchange", "backpack"},
 	}
 
 	for _, exchange := range exchanges {
@@ -464,8 +467,11 @@ type ExchangeConfig struct {
 	AsterUser       string    `json:"asterUser"`
 	AsterSigner     string    `json:"asterSigner"`
 	AsterPrivateKey string    `json:"asterPrivateKey"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	// Backpack 特定字段
+	BackpackAPIKey     string `json:"backpackApiKey"`
+	BackpackPrivateKey string `json:"backpackPrivateKey"` // ED25519私钥 (base64编码)
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // TraderRecord 交易员配置（数据库实体）
@@ -734,12 +740,14 @@ func (d *Database) UpdateAIModel(userID, id string, enabled bool, apiKey, custom
 // GetExchanges 获取用户的交易所配置
 func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 	rows, err := d.db.Query(`
-		SELECT id, user_id, name, type, enabled, api_key, secret_key, testnet, 
+		SELECT id, user_id, name, type, enabled, api_key, secret_key, testnet,
 		       COALESCE(hyperliquid_wallet_addr, '') as hyperliquid_wallet_addr,
 		       COALESCE(aster_user, '') as aster_user,
 		       COALESCE(aster_signer, '') as aster_signer,
 		       COALESCE(aster_private_key, '') as aster_private_key,
-		       created_at, updated_at 
+		       COALESCE(backpack_api_key, '') as backpack_api_key,
+		       COALESCE(backpack_private_key, '') as backpack_private_key,
+		       created_at, updated_at
 		FROM exchanges WHERE user_id = ? ORDER BY id
 	`, userID)
 	if err != nil {
@@ -756,6 +764,7 @@ func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 			&exchange.Enabled, &exchange.APIKey, &exchange.SecretKey, &exchange.Testnet,
 			&exchange.HyperliquidWalletAddr, &exchange.AsterUser,
 			&exchange.AsterSigner, &exchange.AsterPrivateKey,
+			&exchange.BackpackAPIKey, &exchange.BackpackPrivateKey,
 			&exchange.CreatedAt, &exchange.UpdatedAt,
 		)
 		if err != nil {
@@ -766,6 +775,8 @@ func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 		exchange.APIKey = d.decryptSensitiveData(exchange.APIKey)
 		exchange.SecretKey = d.decryptSensitiveData(exchange.SecretKey)
 		exchange.AsterPrivateKey = d.decryptSensitiveData(exchange.AsterPrivateKey)
+		exchange.BackpackAPIKey = d.decryptSensitiveData(exchange.BackpackAPIKey)
+		exchange.BackpackPrivateKey = d.decryptSensitiveData(exchange.BackpackPrivateKey)
 
 		exchanges = append(exchanges, &exchange)
 	}
@@ -774,7 +785,7 @@ func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 }
 
 // UpdateExchange 更新交易所配置，如果不存在则创建用户特定配置
-// 🔒 安全特性：空值不会覆盖现有的敏感字段（api_key, secret_key, aster_private_key）
+// 🔒 安全特性：空值不会覆盖现有的敏感字段（api_key, secret_key, aster_private_key, backpack_api_key, backpack_private_key）
 func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secretKey string, testnet bool, hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey string) error {
 	log.Printf("🔧 UpdateExchange: userID=%s, id=%s, enabled=%v", userID, id, enabled)
 
