@@ -163,7 +163,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       if (e.id === 'hyperliquid') {
         return e.hyperliquidWalletAddr && e.hyperliquidWalletAddr.trim() !== ''
       }
-      // 其他交易所：如果已启用，说明已配置（后端返回的已配置交易所会有 enabled: true）
+      // 其他交易所（包括 Backpack）：如果已启用，说明已配置
       return e.enabled
     }) || []
 
@@ -189,7 +189,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         return e.hyperliquidWalletAddr && e.hyperliquidWalletAddr.trim() !== ''
       }
 
-      // 其他交易所：如果已启用，说明已配置完整（后端只返回已配置的交易所）
+      // 其他交易所（包括 Backpack）：如果已启用，说明已配置完整
       return true
     }) || []
 
@@ -605,7 +605,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     hyperliquidWalletAddr?: string,
     asterUser?: string,
     asterSigner?: string,
-    asterPrivateKey?: string
+    asterPrivateKey?: string,
+    backpackApiKey?: string,
+    backpackPrivateKey?: string
   ) => {
     try {
       // 找到要配置的交易所（从supportedExchanges中）
@@ -635,6 +637,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                   asterUser,
                   asterSigner,
                   asterPrivateKey,
+                  backpackApiKey,
+                  backpackPrivateKey,
                   enabled: true,
                 }
               : e
@@ -650,6 +654,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           asterUser,
           asterSigner,
           asterPrivateKey,
+          backpackApiKey,
+          backpackPrivateKey,
           enabled: true,
         }
         updatedExchanges = [...(allExchanges || []), newExchange]
@@ -668,6 +674,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               aster_user: exchange.asterUser || '',
               aster_signer: exchange.asterSigner || '',
               aster_private_key: exchange.asterPrivateKey || '',
+              backpack_api_key: exchange.backpackApiKey || '',
+              backpack_private_key: exchange.backpackPrivateKey || '',
             },
           ])
         ),
@@ -1762,7 +1770,9 @@ function ExchangeConfigModal({
     hyperliquidWalletAddr?: string,
     asterUser?: string,
     asterSigner?: string,
-    asterPrivateKey?: string
+    asterPrivateKey?: string,
+    backpackApiKey?: string,
+    backpackPrivateKey?: string
   ) => Promise<void>
   onDelete: (exchangeId: string) => void
   onClose: () => void
@@ -1796,6 +1806,10 @@ function ExchangeConfigModal({
   // Hyperliquid 特定字段
   const [hyperliquidWalletAddr, setHyperliquidWalletAddr] = useState('')
 
+  // Backpack 特定字段
+  const [backpackApiKey, setBackpackApiKey] = useState('')
+  const [backpackPrivateKey, setBackpackPrivateKey] = useState('')
+
   // 安全输入状态
   const [secureInputTarget, setSecureInputTarget] = useState<
     null | 'hyperliquid' | 'aster'
@@ -1821,6 +1835,10 @@ function ExchangeConfigModal({
 
       // Hyperliquid 字段
       setHyperliquidWalletAddr(selectedExchange.hyperliquidWalletAddr || '')
+
+      // Backpack 字段
+      setBackpackApiKey(selectedExchange.backpackApiKey || '')
+      setBackpackPrivateKey('') // Don't load existing private key for security
     }
   }, [editingExchangeId, selectedExchange])
 
@@ -1950,6 +1968,20 @@ function ExchangeConfigModal({
         asterUser.trim(),
         asterSigner.trim(),
         asterPrivateKey.trim()
+      )
+    } else if (selectedExchange?.id === 'backpack') {
+      if (!backpackApiKey.trim() || !backpackPrivateKey.trim()) return
+      await onSave(
+        selectedExchangeId,
+        '',
+        '',
+        testnet,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        backpackApiKey.trim(),
+        backpackPrivateKey.trim()
       )
     } else if (selectedExchange?.id === 'okx') {
       if (!apiKey.trim() || !secretKey.trim() || !passphrase.trim()) return
@@ -2552,6 +2584,67 @@ function ExchangeConfigModal({
                     </div>
                   </>
                 )}
+
+                {/* Backpack 交易所的字段 */}
+                {selectedExchange.id === 'backpack' && (
+                  <>
+                    <div>
+                      <label
+                        className="block text-sm font-semibold mb-2"
+                        style={{ color: '#EAECEF' }}
+                      >
+                        {t('apiKey', language)}
+                      </label>
+                      <input
+                        type="password"
+                        value={backpackApiKey}
+                        onChange={(e) => setBackpackApiKey(e.target.value)}
+                        placeholder="请输入 Backpack API Key"
+                        className="w-full px-3 py-2 rounded"
+                        style={{
+                          background: '#0B0E11',
+                          border: '1px solid #2B3139',
+                          color: '#EAECEF',
+                        }}
+                        required
+                      />
+                      <div
+                        className="text-xs mt-1"
+                        style={{ color: '#848E9C' }}
+                      >
+                        Backpack API Key (从 Backpack 交易所获取)
+                      </div>
+                    </div>
+
+                    <div>
+                      <label
+                        className="block text-sm font-semibold mb-2"
+                        style={{ color: '#EAECEF' }}
+                      >
+                        {t('privateKey', language)}
+                      </label>
+                      <input
+                        type="password"
+                        value={backpackPrivateKey}
+                        onChange={(e) => setBackpackPrivateKey(e.target.value)}
+                        placeholder="请输入 ED25519 私钥 (base64 编码)"
+                        className="w-full px-3 py-2 rounded"
+                        style={{
+                          background: '#0B0E11',
+                          border: '1px solid #2B3139',
+                          color: '#EAECEF',
+                        }}
+                        required
+                      />
+                      <div
+                        className="text-xs mt-1"
+                        style={{ color: '#848E9C' }}
+                      >
+                        ED25519 私钥 (base64 编码格式)
+                      </div>
+                    </div>
+                  </>
+                )}
               </>
             )}
           </div>
@@ -2584,9 +2677,12 @@ function ExchangeConfigModal({
                   (!asterUser.trim() ||
                     !asterSigner.trim() ||
                     !asterPrivateKey.trim())) ||
+                (selectedExchange.id === 'backpack' &&
+                  (!backpackApiKey.trim() || !backpackPrivateKey.trim())) ||
                 (selectedExchange.type === 'cex' &&
                   selectedExchange.id !== 'hyperliquid' &&
                   selectedExchange.id !== 'aster' &&
+                  selectedExchange.id !== 'backpack' &&
                   selectedExchange.id !== 'binance' &&
                   selectedExchange.id !== 'okx' &&
                   (!apiKey.trim() || !secretKey.trim()))

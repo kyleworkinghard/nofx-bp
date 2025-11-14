@@ -44,6 +44,8 @@ func SanitizeExchangeConfigForLog(exchanges map[string]struct {
 	AsterUser             string `json:"aster_user"`
 	AsterSigner           string `json:"aster_signer"`
 	AsterPrivateKey       string `json:"aster_private_key"`
+	BackpackApiKey        string `json:"backpack_api_key"`
+	BackpackPrivateKey    string `json:"backpack_private_key"`
 }) map[string]interface{} {
 	safe := make(map[string]interface{})
 	for exchangeID, cfg := range exchanges {
@@ -62,6 +64,9 @@ func SanitizeExchangeConfigForLog(exchanges map[string]struct {
 		if cfg.AsterPrivateKey != "" {
 			safeExchange["aster_private_key"] = MaskSensitiveString(cfg.AsterPrivateKey)
 		}
+		if cfg.BackpackPrivateKey != "" {
+			safeExchange["backpack_private_key"] = MaskSensitiveString(cfg.BackpackPrivateKey)
+		}
 
 		// 非敏感字段直接添加
 		if cfg.HyperliquidWalletAddr != "" {
@@ -72,6 +77,9 @@ func SanitizeExchangeConfigForLog(exchanges map[string]struct {
 		}
 		if cfg.AsterSigner != "" {
 			safeExchange["aster_signer"] = cfg.AsterSigner
+		}
+		if cfg.BackpackApiKey != "" {
+			safeExchange["backpack_api_key"] = cfg.BackpackApiKey
 		}
 
 		safe[exchangeID] = safeExchange

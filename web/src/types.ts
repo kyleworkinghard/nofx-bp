@@ -120,6 +120,9 @@ export interface Exchange {
   asterUser?: string
   asterSigner?: string
   asterPrivateKey?: string
+  // Backpack 特定字段
+  backpackApiKey?: string
+  backpackPrivateKey?: string
 }
 
 export interface CreateTraderRequest {
@@ -163,6 +166,9 @@ export interface UpdateExchangeConfigRequest {
       aster_user?: string
       aster_signer?: string
       aster_private_key?: string
+      // Backpack 特定字段
+      backpack_api_key?: string
+      backpack_private_key?: string
     }
   }
 }

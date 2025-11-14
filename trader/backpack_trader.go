@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -25,14 +24,6 @@ type BackpackTrader struct {
 	// 缓存
 	symbolPrecision map[string]*SymbolPrecision
 	marketInfo      map[string]interface{}
-}
-
-// SymbolPrecision 交易对精度信息
-type SymbolPrecision struct {
-	PricePrecision int
-	QtyPrecision   int
-	MinQty         float64
-	MaxQty         float64
 }
 
 // NewBackpackTrader 创建Backpack交易器
@@ -137,7 +128,10 @@ func (t *BackpackTrader) generateSignature(method, endpoint string, params, data
 
 	// 当前时间戳（毫秒）
 	timestamp := time.Now().UnixMilli()
-	window := int64(5000)
+	window := int64(60000) // 增加到60秒窗口，避免网络延迟导致过期
+
+	// 🐛 调试：打印系统时间
+	log.Printf("🐛 [Backpack] 当前系统时间: %s", time.Now().Format("2006-01-02 15:04:05.000"))
 
 	// 构建签名字符串
 	signatureStr := fmt.Sprintf("instruction=%s", instructionType)
@@ -173,6 +167,10 @@ func (t *BackpackTrader) generateSignature(method, endpoint string, params, data
 	// 添加时间戳和窗口
 	signatureStr += fmt.Sprintf("&timestamp=%d&window=%d", timestamp, window)
 
+	// 🐛 调试：打印签名字符串
+	log.Printf("🐛 [Backpack] 签名字符串: %s", signatureStr)
+	log.Printf("🐛 [Backpack] 时间戳: %d, 窗口: %d", timestamp, window)
+
 	// 使用ED25519签名
 	messageBytes := []byte(signatureStr)
 	signature := ed25519.Sign(t.privateKey, messageBytes)
@@ -188,6 +186,10 @@ func (t *BackpackTrader) generateSignature(method, endpoint string, params, data
 		"X-WINDOW":     fmt.Sprintf("%d", window),
 		"Content-Type": "application/json",
 	}
+
+	// 🐛 调试：打印请求头（隐藏敏感信息）
+	log.Printf("🐛 [Backpack] 请求头: X-TIMESTAMP=%d, X-WINDOW=%d", timestamp, window)
+	log.Printf("🐛 [Backpack] 签名（前20字符）: %s...", signatureB64[:min(20, len(signatureB64))])
 
 	return headers, nil
 }
@@ -260,6 +262,8 @@ func (t *BackpackTrader) makeAuthenticatedRequest(method, endpoint string, param
 
 	// 检查HTTP状态码
 	if resp.StatusCode != 200 {
+		log.Printf("❌ [Backpack] API错误: %s %s -> HTTP %d", method, endpoint, resp.StatusCode)
+		log.Printf("❌ [Backpack] 错误响应: %s", string(bodyBytes))
 		return nil, fmt.Errorf("API请求失败: HTTP %d - %s", resp.StatusCode, string(bodyBytes))
 	}
 
@@ -279,6 +283,77 @@ func (t *BackpackTrader) makeAuthenticatedRequest(method, endpoint string, param
 		// 纯文本响应
 		textResult := string(bodyBytes)
 		return map[string]interface{}{"text": textResult}, nil
+	}
+
+	return result, nil
+}
+
+// makeAuthenticatedRequestArray 发起认证请求并返回数组
+func (t *BackpackTrader) makeAuthenticatedRequestArray(method, endpoint string, params, data map[string]string) ([]interface{}, error) {
+	// 生成签名头部
+	headers, err := t.generateSignature(method, endpoint, params, data)
+	if err != nil {
+		return nil, fmt.Errorf("生成签名失败: %w", err)
+	}
+
+	// 构建完整URL
+	url := strings.TrimSuffix(t.baseURL, "/") + endpoint
+
+	// 创建请求
+	var req *http.Request
+	method = strings.ToUpper(method)
+
+	if method == "GET" {
+		// GET请求，参数放在URL中
+		if len(params) > 0 {
+			queryParams := make([]string, 0, len(params))
+			for k, v := range params {
+				if v != "" {
+					queryParams = append(queryParams, fmt.Sprintf("%s=%s", k, v))
+				}
+			}
+			if len(queryParams) > 0 {
+				url += "?" + strings.Join(queryParams, "&")
+			}
+		}
+		req, err = http.NewRequest(method, url, nil)
+	} else {
+		return nil, fmt.Errorf("不支持的HTTP方法: %s", method)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	// 设置请求头
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// 发送请求
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 检查HTTP状态码
+	if resp.StatusCode != 200 {
+		log.Printf("❌ [Backpack] API错误: %s %s -> HTTP %d", method, endpoint, resp.StatusCode)
+		log.Printf("❌ [Backpack] 错误响应: %s", string(bodyBytes))
+		return nil, fmt.Errorf("API请求失败: HTTP %d - %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// 解析JSON数组
+	var result []interface{}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w, 响应: %s", err, string(bodyBytes))
 	}
 
 	return result, nil
@@ -364,21 +439,6 @@ func (t *BackpackTrader) mapSymbol(symbol string) string {
 	return symbol
 }
 
-// calculatePrecision 根据stepSize计算精度位数
-func calculatePrecision(stepSize string) int {
-	stepFloat, err := strconv.ParseFloat(stepSize, 64)
-	if err != nil || stepFloat >= 1 {
-		return 0
-	}
-
-	// 计算小数点后的位数
-	precision := -int(math.Log10(stepFloat))
-	if precision < 0 {
-		precision = 0
-	}
-	return precision
-}
-
 // formatFloat 格式化浮点数，去除末尾的0
 func formatFloat(val float64, precision int) string {
 	formatted := strconv.FormatFloat(val, 'f', precision, 64)
@@ -386,6 +446,14 @@ func formatFloat(val float64, precision int) string {
 	formatted = strings.TrimRight(formatted, "0")
 	formatted = strings.TrimRight(formatted, ".")
 	return formatted
+}
+
+// min 返回两个整数中的较小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ==================== Trader接口实现 ====================
@@ -400,47 +468,66 @@ func (t *BackpackTrader) GetBalance() (map[string]interface{}, error) {
 		return nil, fmt.Errorf("获取余额失败: %w", err)
 	}
 
+	// 🐛 调试：打印原始响应
+	log.Printf("🐛 [Backpack] 原始余额响应: %+v", resp)
+
 	// 解析响应
-	// 响应格式: {"collateral": [{"asset": "USDC", "total": "1000.5", "available": "500.25", ...}]}
-	collateralData, ok := resp["collateral"]
-	if !ok {
-		return nil, fmt.Errorf("响应缺少 collateral 字段")
-	}
+	// Backpack 响应格式:
+	// {
+	//   "netEquity": 499.9,
+	//   "netEquityAvailable": 499.9,
+	//   "pnlUnrealized": 0,
+	//   "collateral": [{"symbol": "USDC", "totalQuantity": "499.9", "availableQuantity": "499.9", ...}]
+	// }
 
-	collateralList, ok := collateralData.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("collateral 格式错误")
-	}
-
-	// 计算总余额
+	// 优先使用顶层字段
 	var totalWalletBalance float64 = 0
 	var availableBalance float64 = 0
 	var totalUnrealizedProfit float64 = 0
 
-	for _, item := range collateralList {
-		collateral, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
+	// 获取总净值
+	if netEquity, ok := resp["netEquity"].(float64); ok {
+		totalWalletBalance = netEquity
+	}
 
-		// 获取总额
-		if totalStr, ok := collateral["total"].(string); ok {
-			if total, err := strconv.ParseFloat(totalStr, 64); err == nil {
-				totalWalletBalance += total
-			}
-		}
+	// 获取可用净值
+	if netEquityAvailable, ok := resp["netEquityAvailable"].(float64); ok {
+		availableBalance = netEquityAvailable
+	}
 
-		// 获取可用余额
-		if availableStr, ok := collateral["available"].(string); ok {
-			if available, err := strconv.ParseFloat(availableStr, 64); err == nil {
-				availableBalance += available
-			}
-		}
+	// 获取未实现盈亏
+	if pnlUnrealized, ok := resp["pnlUnrealized"].(float64); ok {
+		totalUnrealizedProfit = pnlUnrealized
+	}
 
-		// 获取未实现盈亏（如果有）
-		if unrealizedStr, ok := collateral["unrealized"].(string); ok {
-			if unrealized, err := strconv.ParseFloat(unrealizedStr, 64); err == nil {
-				totalUnrealizedProfit += unrealized
+	// 如果顶层字段为空，尝试从 collateral 数组中计算
+	if totalWalletBalance == 0 {
+		if collateralData, ok := resp["collateral"]; ok {
+			if collateralList, ok := collateralData.([]interface{}); ok {
+				for _, item := range collateralList {
+					collateral, ok := item.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					// 获取总额 (totalQuantity)
+					if totalQtyStr, ok := collateral["totalQuantity"].(string); ok {
+						if total, err := strconv.ParseFloat(totalQtyStr, 64); err == nil {
+							totalWalletBalance += total
+						}
+					} else if totalQty, ok := collateral["totalQuantity"].(float64); ok {
+						totalWalletBalance += totalQty
+					}
+
+					// 获取可用余额 (availableQuantity)
+					if availableQtyStr, ok := collateral["availableQuantity"].(string); ok {
+						if available, err := strconv.ParseFloat(availableQtyStr, 64); err == nil {
+							availableBalance += available
+						}
+					} else if availableQty, ok := collateral["availableQuantity"].(float64); ok {
+						availableBalance += availableQty
+					}
+				}
 			}
 		}
 	}
@@ -461,22 +548,10 @@ func (t *BackpackTrader) GetBalance() (map[string]interface{}, error) {
 func (t *BackpackTrader) GetPositions() ([]map[string]interface{}, error) {
 	log.Printf("📊 [Backpack] 获取持仓信息...")
 
-	// 调用 /api/v1/position 获取持仓
-	resp, err := t.makeAuthenticatedRequest("GET", "/api/v1/position", nil, nil)
+	// 调用 /api/v1/position 获取持仓（返回数组）
+	positionList, err := t.makeAuthenticatedRequestArray("GET", "/api/v1/position", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("获取持仓失败: %w", err)
-	}
-
-	// 如果响应是数组，直接处理
-	var positionList []interface{}
-	if positions, ok := resp["positions"].([]interface{}); ok {
-		positionList = positions
-	} else if respArray, ok := interface{}(resp).([]interface{}); ok {
-		// 如果响应本身就是数组
-		positionList = respArray
-	} else {
-		// 可能响应是单个对象，包装成数组
-		positionList = []interface{}{resp}
 	}
 
 	positions := make([]map[string]interface{}, 0)
@@ -794,7 +869,7 @@ func (t *BackpackTrader) FormatQuantity(symbol string, quantity float64) (string
 	}
 
 	// 格式化数量
-	formatted := formatFloat(quantity, precision.QtyPrecision)
+	formatted := formatFloat(quantity, precision.QuantityPrecision)
 	return formatted, nil
 }
 
@@ -831,10 +906,10 @@ func (t *BackpackTrader) getSymbolPrecision(symbol string) (*SymbolPrecision, er
 
 		// 解析精度信息
 		precision := &SymbolPrecision{
-			PricePrecision: 2,  // 默认价格精度
-			QtyPrecision:   8,  // 默认数量精度
-			MinQty:         0.001,
-			MaxQty:         1000000,
+			PricePrecision:    2,     // 默认价格精度
+			QuantityPrecision: 8,     // 默认数量精度
+			TickSize:          0.01,  // 默认价格步进
+			StepSize:          0.00000001, // 默认数量步进
 		}
 
 		// 从filters中获取精度
@@ -849,11 +924,9 @@ func (t *BackpackTrader) getSymbolPrecision(symbol string) (*SymbolPrecision, er
 			// 数量精度
 			if qtyFilter, ok := filters["quantity"].(map[string]interface{}); ok {
 				if stepSize, ok := qtyFilter["stepSize"].(string); ok {
-					precision.QtyPrecision = calculatePrecision(stepSize)
-				}
-				if minQty, ok := qtyFilter["minQuantity"].(string); ok {
-					if min, err := strconv.ParseFloat(minQty, 64); err == nil {
-						precision.MinQty = min
+					precision.QuantityPrecision = calculatePrecision(stepSize)
+					if step, err := strconv.ParseFloat(stepSize, 64); err == nil {
+						precision.StepSize = step
 					}
 				}
 			}
@@ -861,7 +934,7 @@ func (t *BackpackTrader) getSymbolPrecision(symbol string) (*SymbolPrecision, er
 
 		// 缓存精度信息
 		t.symbolPrecision[symbol] = precision
-		log.Printf("✓ [Backpack] %s 精度: 价格=%d位, 数量=%d位", symbol, precision.PricePrecision, precision.QtyPrecision)
+		log.Printf("✓ [Backpack] %s 精度: 价格=%d位, 数量=%d位", symbol, precision.PricePrecision, precision.QuantityPrecision)
 		return precision, nil
 	}
 

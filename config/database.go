@@ -302,7 +302,7 @@ func (d *Database) initDefaultData() error {
 		{"binance", "Binance Futures", "binance"},
 		{"hyperliquid", "Hyperliquid", "hyperliquid"},
 		{"aster", "Aster DEX", "aster"},
-		{"backpack", "Backpack Exchange", "backpack"},
+		{"backpack", "Backpack Exchange", "cex"},
 	}
 
 	for _, exchange := range exchanges {
@@ -377,6 +377,8 @@ func (d *Database) migrateExchangesTable() error {
 			aster_user TEXT DEFAULT '',
 			aster_signer TEXT DEFAULT '',
 			aster_private_key TEXT DEFAULT '',
+			backpack_api_key TEXT DEFAULT '',
+			backpack_private_key TEXT DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (id, user_id),
@@ -464,12 +466,12 @@ type ExchangeConfig struct {
 	// Reference: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets
 	HyperliquidWalletAddr string `json:"hyperliquidWalletAddr"` // Main Wallet Address (holds funds, never expose private key)
 	// Aster 特定字段
-	AsterUser       string    `json:"asterUser"`
-	AsterSigner     string    `json:"asterSigner"`
-	AsterPrivateKey string    `json:"asterPrivateKey"`
+	AsterUser       string `json:"asterUser"`
+	AsterSigner     string `json:"asterSigner"`
+	AsterPrivateKey string `json:"asterPrivateKey"`
 	// Backpack 特定字段
-	BackpackAPIKey     string `json:"backpackApiKey"`
-	BackpackPrivateKey string `json:"backpackPrivateKey"` // ED25519私钥 (base64编码)
+	BackpackAPIKey     string    `json:"backpackApiKey"`
+	BackpackPrivateKey string    `json:"backpackPrivateKey"` // ED25519私钥 (base64编码)
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
@@ -786,7 +788,7 @@ func (d *Database) GetExchanges(userID string) ([]*ExchangeConfig, error) {
 
 // UpdateExchange 更新交易所配置，如果不存在则创建用户特定配置
 // 🔒 安全特性：空值不会覆盖现有的敏感字段（api_key, secret_key, aster_private_key, backpack_api_key, backpack_private_key）
-func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secretKey string, testnet bool, hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey string) error {
+func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secretKey string, testnet bool, hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey, backpackApiKey, backpackPrivateKey string) error {
 	log.Printf("🔧 UpdateExchange: userID=%s, id=%s, enabled=%v", userID, id, enabled)
 
 	// 构建动态 UPDATE SET 子句
@@ -818,6 +820,18 @@ func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secre
 		encryptedAsterPrivateKey := d.encryptSensitiveData(asterPrivateKey)
 		setClauses = append(setClauses, "aster_private_key = ?")
 		args = append(args, encryptedAsterPrivateKey)
+	}
+
+	if backpackApiKey != "" {
+		encryptedBackpackApiKey := d.encryptSensitiveData(backpackApiKey)
+		setClauses = append(setClauses, "backpack_api_key = ?")
+		args = append(args, encryptedBackpackApiKey)
+	}
+
+	if backpackPrivateKey != "" {
+		encryptedBackpackPrivateKey := d.encryptSensitiveData(backpackPrivateKey)
+		setClauses = append(setClauses, "backpack_private_key = ?")
+		args = append(args, encryptedBackpackPrivateKey)
 	}
 
 	// WHERE 条件
@@ -860,6 +874,9 @@ func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secre
 		} else if id == "aster" {
 			name = "Aster DEX"
 			typ = "dex"
+		} else if id == "backpack" {
+			name = "Backpack Exchange"
+			typ = "cex"
 		} else {
 			name = id + " Exchange"
 			typ = "cex"
@@ -867,12 +884,20 @@ func (d *Database) UpdateExchange(userID, id string, enabled bool, apiKey, secre
 
 		log.Printf("🆕 UpdateExchange: 创建新记录 ID=%s, name=%s, type=%s", id, name, typ)
 
+		// 加密敏感字段
+		encryptedAPIKey := d.encryptSensitiveData(apiKey)
+		encryptedSecretKey := d.encryptSensitiveData(secretKey)
+		encryptedAsterPrivateKey := d.encryptSensitiveData(asterPrivateKey)
+		encryptedBackpackApiKey := d.encryptSensitiveData(backpackApiKey)
+		encryptedBackpackPrivateKey := d.encryptSensitiveData(backpackPrivateKey)
+
 		// 创建用户特定的配置，使用原始的交易所ID
 		_, err = d.db.Exec(`
 			INSERT INTO exchanges (id, user_id, name, type, enabled, api_key, secret_key, testnet,
-			                       hyperliquid_wallet_addr, aster_user, aster_signer, aster_private_key, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-		`, id, userID, name, typ, enabled, apiKey, secretKey, testnet, hyperliquidWalletAddr, asterUser, asterSigner, asterPrivateKey)
+			                       hyperliquid_wallet_addr, aster_user, aster_signer, aster_private_key,
+			                       backpack_api_key, backpack_private_key, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+		`, id, userID, name, typ, enabled, encryptedAPIKey, encryptedSecretKey, testnet, hyperliquidWalletAddr, asterUser, asterSigner, encryptedAsterPrivateKey, encryptedBackpackApiKey, encryptedBackpackPrivateKey)
 
 		if err != nil {
 			log.Printf("❌ UpdateExchange: 创建记录失败: %v", err)
