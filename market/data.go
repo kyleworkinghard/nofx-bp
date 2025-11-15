@@ -525,12 +525,46 @@ func formatFloatSlice(values []float64) string {
 }
 
 // Normalize 标准化symbol,确保是USDT交易对
+// 支持多交易所格式转换为币安格式
 func Normalize(symbol string) string {
 	symbol = strings.ToUpper(symbol)
+
+	// Backpack格式转换: ETH_USDC_PERP -> ETHUSDT
+	if strings.Contains(symbol, "_") && strings.HasSuffix(symbol, "_PERP") {
+		// 移除 _PERP 后缀
+		symbol = strings.TrimSuffix(symbol, "_PERP")
+		// 移除下划线: ETH_USDC -> ETHUSDC
+		symbol = strings.ReplaceAll(symbol, "_", "")
+		// 将 USDC 替换为 USDT (币安只有USDT交易对)
+		symbol = strings.ReplaceAll(symbol, "USDC", "USDT")
+		return symbol
+	}
+
+	// 如果已经是币安USDT格式，直接返回
 	if strings.HasSuffix(symbol, "USDT") {
 		return symbol
 	}
+
+	// 默认添加USDT后缀
 	return symbol + "USDT"
+}
+
+// ConvertToBackpackSymbol 将币安格式转换为Backpack格式
+// ETHUSDT -> ETH_USDC_PERP
+// BTCUSDT -> BTC_USDC_PERP
+func ConvertToBackpackSymbol(binanceSymbol string) string {
+	binanceSymbol = strings.ToUpper(binanceSymbol)
+
+	// 如果已经是Backpack格式，直接返回
+	if strings.Contains(binanceSymbol, "_") && strings.HasSuffix(binanceSymbol, "_PERP") {
+		return binanceSymbol
+	}
+
+	// 移除USDT后缀
+	baseCurrency := strings.TrimSuffix(binanceSymbol, "USDT")
+
+	// 转换为Backpack永续合约格式
+	return baseCurrency + "_USDC_PERP"
 }
 
 // parseFloat 解析float值

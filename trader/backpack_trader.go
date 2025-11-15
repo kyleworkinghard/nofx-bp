@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"nofx/market"
 	"sort"
 	"strconv"
 	"strings"
@@ -409,34 +410,8 @@ func (t *BackpackTrader) makePublicRequest(method, endpoint string, params map[s
 // mapSymbol 映射符号到Backpack格式
 // 例如: BTCUSDT -> BTC_USDC_PERP
 func (t *BackpackTrader) mapSymbol(symbol string) string {
-	// 常见映射
-	symbolMap := map[string]string{
-		"BTCUSDT":  "BTC_USDC_PERP",
-		"ETHUSDT":  "ETH_USDC_PERP",
-		"SOLUSDT":  "SOL_USDC_PERP",
-		"BNBUSDT":  "BNB_USDC_PERP",
-		"XRPUSDT":  "XRP_USDC_PERP",
-		"DOGEUSDT": "DOGE_USDC_PERP",
-		"ADAUSDT":  "ADA_USDC_PERP",
-		"HYPEUSDT": "HYPE_USDC_PERP",
-	}
-
-	if mapped, ok := symbolMap[symbol]; ok {
-		return mapped
-	}
-
-	// 如果已经是Backpack格式，直接返回
-	if strings.Contains(symbol, "_PERP") {
-		return symbol
-	}
-
-	// 尝试自动转换: XXXUSDT -> XXX_USDC_PERP
-	if strings.HasSuffix(symbol, "USDT") {
-		base := strings.TrimSuffix(symbol, "USDT")
-		return fmt.Sprintf("%s_USDC_PERP", base)
-	}
-
-	return symbol
+	// 使用market包的统一转换函数
+	return market.ConvertToBackpackSymbol(symbol)
 }
 
 // formatFloat 格式化浮点数，去除末尾的0
@@ -584,8 +559,10 @@ func (t *BackpackTrader) GetPositions() ([]map[string]interface{}, error) {
 			size = -netQty
 		}
 
-		// 获取符号
-		symbol, _ := pos["symbol"].(string)
+		// 获取符号（Backpack格式）
+		backpackSymbol, _ := pos["symbol"].(string)
+		// 转换为币安格式，以便与系统其他部分兼容
+		symbol := market.Normalize(backpackSymbol) // ETH_USDC_PERP -> ETHUSDT
 
 		// 获取入场价格
 		entryPriceStr, _ := pos["entryPrice"].(string)
@@ -621,7 +598,7 @@ func (t *BackpackTrader) GetPositions() ([]map[string]interface{}, error) {
 		}
 
 		positions = append(positions, position)
-		log.Printf("  - %s: %s %.4f @ %.2f (PnL: %.2f)", symbol, side, size, entryPrice, unrealizedPnL)
+		log.Printf("  - %s (%s): %s %.4f @ %.2f (PnL: %.2f)", symbol, backpackSymbol, side, size, entryPrice, unrealizedPnL)
 	}
 
 	log.Printf("✓ [Backpack] 共 %d 个持仓", len(positions))
@@ -665,7 +642,9 @@ func (t *BackpackTrader) GetMarketPrice(symbol string) (float64, error) {
 // createOrder 创建订单（内部方法）
 // side: "Bid" (做多) 或 "Ask" (做空)
 // orderType: "Market" 或 "Limit"
-func (t *BackpackTrader) createOrder(symbol, side, orderType string, quantity float64, price *float64) (map[string]interface{}, error) {
+// stopLoss: 止损价格（0表示不设置）
+// takeProfit: 止盈价格（0表示不设置）
+func (t *BackpackTrader) createOrder(symbol, side, orderType string, quantity float64, price *float64, stopLoss, takeProfit float64) (map[string]interface{}, error) {
 	backpackSymbol := t.mapSymbol(symbol)
 
 	// 格式化数量
@@ -689,6 +668,16 @@ func (t *BackpackTrader) createOrder(symbol, side, orderType string, quantity fl
 		data["price"] = priceStr
 	}
 
+	// ✅ Backpack 止盈止损：在开仓订单中设置（OCO订单，互相取消）
+	if stopLoss > 0 {
+		data["stopLossTriggerPrice"] = formatFloat(stopLoss, 2)
+		log.Printf("  → 止损触发价: %.2f", stopLoss)
+	}
+	if takeProfit > 0 {
+		data["takeProfitTriggerPrice"] = formatFloat(takeProfit, 2)
+		log.Printf("  → 止盈触发价: %.2f", takeProfit)
+	}
+
 	log.Printf("📤 [Backpack] 下单: %s %s %s %s", side, orderType, qtyStr, backpackSymbol)
 
 	// 发送订单
@@ -703,34 +692,100 @@ func (t *BackpackTrader) createOrder(symbol, side, orderType string, quantity fl
 
 // OpenLong 开多仓
 func (t *BackpackTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	log.Printf("🟢 [Backpack] 开多仓: %s 数量=%.4f 杠杆=%dx", symbol, quantity, leverage)
+	// 将币安格式转换为Backpack格式: ETHUSDT -> ETH_USDC_PERP
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+	log.Printf("🟢 [Backpack] 开多仓: %s (原始:%s) 数量=%.4f 杠杆=%dx", backpackSymbol, symbol, quantity, leverage)
 
 	// Backpack使用Bid表示做多（买入）
-	return t.createOrder(symbol, "Bid", "Market", quantity, nil)
+	// 注意：这个方法不带止盈止损，如需止盈止损请使用 OpenLongWithProtection
+	return t.createOrder(backpackSymbol, "Bid", "Market", quantity, nil, 0, 0)
 }
 
 // OpenShort 开空仓
 func (t *BackpackTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	log.Printf("🔴 [Backpack] 开空仓: %s 数量=%.4f 杠杆=%dx", symbol, quantity, leverage)
+	// 将币安格式转换为Backpack格式
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+	log.Printf("🔴 [Backpack] 开空仓: %s (原始:%s) 数量=%.4f 杠杆=%dx", backpackSymbol, symbol, quantity, leverage)
 
 	// Backpack使用Ask表示做空（卖出）
-	return t.createOrder(symbol, "Ask", "Market", quantity, nil)
+	// 注意：这个方法不带止盈止损，如需止盈止损请使用 OpenShortWithProtection
+	return t.createOrder(backpackSymbol, "Ask", "Market", quantity, nil, 0, 0)
 }
 
 // CloseLong 平多仓
 func (t *BackpackTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
-	log.Printf("🟡 [Backpack] 平多仓: %s 数量=%.4f", symbol, quantity)
+	// 将币安格式转换为Backpack格式
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+
+	// 如果 quantity = 0，表示全部平仓，需要先获取实际持仓数量
+	if quantity == 0 {
+		positions, err := t.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("获取持仓失败: %w", err)
+		}
+
+		// 查找该币种的多仓持仓
+		found := false
+		for _, pos := range positions {
+			posSymbol, _ := pos["symbol"].(string)
+			posSide, _ := pos["side"].(string)
+			posAmt, _ := pos["positionAmt"].(float64)
+
+			if posSymbol == symbol && posSide == "long" && posAmt > 0 {
+				quantity = posAmt
+				found = true
+				log.Printf("  → 全部平仓，实际数量: %.4f", quantity)
+				break
+			}
+		}
+
+		if !found || quantity == 0 {
+			return nil, fmt.Errorf("没有找到 %s 的多仓持仓", symbol)
+		}
+	}
+
+	log.Printf("🟡 [Backpack] 平多仓: %s (原始:%s) 数量=%.4f", backpackSymbol, symbol, quantity)
 
 	// 平多仓 = 卖出 = Ask
-	return t.createOrder(symbol, "Ask", "Market", quantity, nil)
+	return t.createOrder(backpackSymbol, "Ask", "Market", quantity, nil, 0, 0)
 }
 
 // CloseShort 平空仓
 func (t *BackpackTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
-	log.Printf("🟡 [Backpack] 平空仓: %s 数量=%.4f", symbol, quantity)
+	// 将币安格式转换为Backpack格式
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+
+	// 如果 quantity = 0，表示全部平仓，需要先获取实际持仓数量
+	if quantity == 0 {
+		positions, err := t.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("获取持仓失败: %w", err)
+		}
+
+		// 查找该币种的空仓持仓
+		found := false
+		for _, pos := range positions {
+			posSymbol, _ := pos["symbol"].(string)
+			posSide, _ := pos["side"].(string)
+			posAmt, _ := pos["positionAmt"].(float64)
+
+			if posSymbol == symbol && posSide == "short" && posAmt > 0 {
+				quantity = posAmt
+				found = true
+				log.Printf("  → 全部平仓，实际数量: %.4f", quantity)
+				break
+			}
+		}
+
+		if !found || quantity == 0 {
+			return nil, fmt.Errorf("没有找到 %s 的空仓持仓", symbol)
+		}
+	}
+
+	log.Printf("🟡 [Backpack] 平空仓: %s (原始:%s) 数量=%.4f", backpackSymbol, symbol, quantity)
 
 	// 平空仓 = 买入 = Bid
-	return t.createOrder(symbol, "Bid", "Market", quantity, nil)
+	return t.createOrder(backpackSymbol, "Bid", "Market", quantity, nil, 0, 0)
 }
 
 // SetLeverage 设置杠杆（Backpack可能不支持动态调整杠杆）
@@ -799,20 +854,24 @@ func (t *BackpackTrader) SetStopLoss(symbol string, positionSide string, quantit
 
 	// 确定订单方向（止损是反向订单）
 	var side string
-	if positionSide == "long" {
+	if positionSide == "long" || positionSide == "LONG" {
 		side = "Ask" // 多仓止损 = 卖出
 	} else {
 		side = "Bid" // 空仓止损 = 买入
 	}
 
-	// 创建止损订单（使用StopMarket类型）
+	// ⚠️ Backpack 注意事项：
+	// Backpack 的真正止损应该在开仓时通过 stopLossTriggerPrice 参数设置
+	// 这里作为事后设置，我们使用 Limit 订单挂在止损价格
+	// 虽然不是触发式止损，但可以在价格到达时自动成交
 	qtyStr, _ := t.FormatQuantity(backpackSymbol, quantity)
 	data := map[string]string{
-		"symbol":     backpackSymbol,
-		"side":       side,
-		"orderType":  "StopMarket",
-		"quantity":   qtyStr,
-		"triggerPrice": formatFloat(stopPrice, 2),
+		"symbol":    backpackSymbol,
+		"side":      side,
+		"orderType": "Limit",  // 使用 Limit 而不是 StopMarket
+		"quantity":  qtyStr,
+		"price":     formatFloat(stopPrice, 2),
+		"timeInForce": "GTC",  // Good Till Cancel
 	}
 
 	_, err := t.makeAuthenticatedRequest("POST", "/api/v1/order", nil, data)
@@ -820,7 +879,7 @@ func (t *BackpackTrader) SetStopLoss(symbol string, positionSide string, quantit
 		return fmt.Errorf("设置止损失败: %w", err)
 	}
 
-	log.Printf("✓ [Backpack] 止损已设置")
+	log.Printf("✓ [Backpack] 止损已设置（使用Limit订单）")
 	return nil
 }
 
@@ -831,7 +890,7 @@ func (t *BackpackTrader) SetTakeProfit(symbol string, positionSide string, quant
 
 	// 确定订单方向（止盈是反向订单）
 	var side string
-	if positionSide == "long" {
+	if positionSide == "long" || positionSide == "LONG" {
 		side = "Ask" // 多仓止盈 = 卖出
 	} else {
 		side = "Bid" // 空仓止盈 = 买入
@@ -840,11 +899,12 @@ func (t *BackpackTrader) SetTakeProfit(symbol string, positionSide string, quant
 	// 创建限价止盈订单
 	qtyStr, _ := t.FormatQuantity(backpackSymbol, quantity)
 	data := map[string]string{
-		"symbol":    backpackSymbol,
-		"side":      side,
-		"orderType": "Limit",
-		"quantity":  qtyStr,
-		"price":     formatFloat(takeProfitPrice, 2),
+		"symbol":      backpackSymbol,
+		"side":        side,
+		"orderType":   "Limit",
+		"quantity":    qtyStr,
+		"price":       formatFloat(takeProfitPrice, 2),
+		"timeInForce": "GTC",  // Good Till Cancel
 	}
 
 	_, err := t.makeAuthenticatedRequest("POST", "/api/v1/order", nil, data)
@@ -852,7 +912,111 @@ func (t *BackpackTrader) SetTakeProfit(symbol string, positionSide string, quant
 		return fmt.Errorf("设置止盈失败: %w", err)
 	}
 
-	log.Printf("✓ [Backpack] 止盈已设置")
+	log.Printf("✓ [Backpack] 止盈已设置（使用Limit订单）")
+	return nil
+}
+
+// getOrderStatus 查询订单状态
+func (t *BackpackTrader) getOrderStatus(symbol, orderID string) (string, error) {
+	backpackSymbol := t.mapSymbol(symbol)
+
+	params := map[string]string{
+		"symbol":  backpackSymbol,
+		"orderId": orderID,
+	}
+
+	resp, err := t.makeAuthenticatedRequest("GET", "/api/v1/order", params, nil)
+	if err != nil {
+		return "", fmt.Errorf("查询订单状态失败: %w", err)
+	}
+
+	// 获取订单状态
+	status, ok := resp["status"].(string)
+	if !ok {
+		return "", fmt.Errorf("无法解析订单状态")
+	}
+
+	return status, nil
+}
+
+// waitForOrderFilled 等待订单成交（最多等待30秒）
+func (t *BackpackTrader) waitForOrderFilled(symbol, orderID string, maxWaitSeconds int) error {
+	backpackSymbol := t.mapSymbol(symbol)
+	log.Printf("⏳ [Backpack] 等待订单成交: %s (订单ID: %s)", backpackSymbol, orderID)
+
+	if maxWaitSeconds <= 0 {
+		maxWaitSeconds = 30
+	}
+
+	// 每隔0.5秒检查一次
+	checkInterval := 500 * time.Millisecond
+	maxAttempts := maxWaitSeconds * 2 // 每秒2次
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		time.Sleep(checkInterval)
+
+		status, err := t.getOrderStatus(symbol, orderID)
+		if err != nil {
+			log.Printf("  ⚠️ 查询订单状态失败: %v", err)
+			continue
+		}
+
+		log.Printf("  → 订单状态: %s (第%d次检查)", status, attempt+1)
+
+		switch status {
+		case "Filled":
+			log.Printf("  ✓ 订单已完全成交")
+			return nil
+		case "PartiallyFilled":
+			log.Printf("  ⏳ 订单部分成交，继续等待...")
+			continue
+		case "New":
+			// 订单还在队列中，继续等待
+			continue
+		case "Cancelled", "Expired", "Rejected":
+			return fmt.Errorf("订单未成交，状态: %s", status)
+		default:
+			log.Printf("  ⚠️ 未知订单状态: %s，继续等待...", status)
+			continue
+		}
+	}
+
+	return fmt.Errorf("等待订单成交超时（%d秒）", maxWaitSeconds)
+}
+
+// OpenLongWithProtection 开多仓并设置止盈止损（Backpack专用方法）
+// ✅ 使用 Backpack 的 OCO 订单功能，在开仓时同时设置止盈止损
+func (t *BackpackTrader) OpenLongWithProtection(symbol string, quantity float64, leverage int, stopLoss, takeProfit float64) error {
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+	log.Printf("🟢 [Backpack] 开多仓（带保护）: %s 数量=%.4f 杠杆=%dx SL=%.2f TP=%.2f",
+		symbol, quantity, leverage, stopLoss, takeProfit)
+
+	// ✅ Backpack 一次性开仓+止盈止损（OCO订单）
+	// 止盈和止损是互相关联的，触发一个会自动取消另一个
+	order, err := t.createOrder(backpackSymbol, "Bid", "Market", quantity, nil, stopLoss, takeProfit)
+	if err != nil {
+		return fmt.Errorf("开仓失败: %w", err)
+	}
+
+	log.Printf("✓ [Backpack] 开多仓完成（带OCO保护），订单ID: %v", order["id"])
+	return nil
+}
+
+// OpenShortWithProtection 开空仓并设置止盈止损（Backpack专用方法）
+// ✅ 使用 Backpack 的 OCO 订单功能，在开仓时同时设置止盈止损
+func (t *BackpackTrader) OpenShortWithProtection(symbol string, quantity float64, leverage int, stopLoss, takeProfit float64) error {
+	backpackSymbol := market.ConvertToBackpackSymbol(symbol)
+	log.Printf("🔴 [Backpack] 开空仓（带保护）: %s 数量=%.4f 杠杆=%dx SL=%.2f TP=%.2f",
+		symbol, quantity, leverage, stopLoss, takeProfit)
+
+	// ✅ Backpack 一次性开仓+止盈止损（OCO订单）
+	// 止盈和止损是互相关联的，触发一个会自动取消另一个
+	order, err := t.createOrder(backpackSymbol, "Ask", "Market", quantity, nil, stopLoss, takeProfit)
+	if err != nil {
+		return fmt.Errorf("开仓失败: %w", err)
+	}
+
+	log.Printf("✓ [Backpack] 开空仓完成（带OCO保护），订单ID: %v", order["id"])
 	return nil
 }
 

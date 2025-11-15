@@ -114,6 +114,8 @@ type AutoTrader struct {
 	lastBalanceSyncTime   time.Time                        // 上次余额同步时间
 	database              interface{}                      // 数据库引用（用于自动更新余额）
 	userID                string                           // 用户ID
+	klineCache            *market.KlineCache               // K线缓存
+	signalDetector        *market.SignalDetector           // 信号检测器
 }
 
 // NewAutoTrader 创建自动交易器
@@ -249,6 +251,8 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
 		database:              database,
 		userID:                userID,
+		klineCache:            market.GetKlineCache(),    // 初始化K线缓存
+		signalDetector:        market.NewSignalDetector(), // 初始化信号检测器
 	}, nil
 }
 
@@ -260,7 +264,7 @@ func (at *AutoTrader) Run() error {
 
 	log.Println("🚀 AI驱动自动交易系统启动")
 	log.Printf("💰 初始余额: %.2f USDT", at.initialBalance)
-	log.Printf("⚙️  扫描间隔: %v", at.config.ScanInterval)
+	log.Printf("⏰ 监控周期: 每5分钟准点触发 (:00, :05, :10, :15, ...)")
 	log.Println("🤖 AI将全权决定杠杆、仓位大小、止损止盈等参数")
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()
@@ -268,13 +272,49 @@ func (at *AutoTrader) Run() error {
 	// 启动回撤监控
 	at.startDrawdownMonitor()
 
-	ticker := time.NewTicker(at.config.ScanInterval)
-	defer ticker.Stop()
-
-	// 首次立即执行
-	if err := at.runCycle(); err != nil {
-		log.Printf("❌ 执行失败: %v", err)
+	// 初始化候选币种的K线缓存
+	candidateCoins, err := at.getCandidateCoins()
+	if err != nil {
+		log.Printf("⚠️  获取候选币种失败: %v", err)
+	} else {
+		log.Printf("📊 初始化K线缓存中...")
+		for _, coin := range candidateCoins {
+			if err := at.klineCache.InitSymbol(coin.Symbol, 20); err != nil {
+				log.Printf("⚠️  初始化 %s K线缓存失败: %v", coin.Symbol, err)
+			}
+		}
+		log.Printf("✓ K线缓存初始化完成")
 	}
+
+	// 计算下一个5分钟整点的等待时间
+	now := time.Now()
+	nextMinute := ((now.Minute() / 5) + 1) * 5
+	if nextMinute >= 60 {
+		nextMinute = 0
+	}
+	nextRun := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), nextMinute, 0, 0, now.Location())
+	if nextRun.Before(now) {
+		nextRun = nextRun.Add(time.Hour)
+	}
+
+	waitDuration := nextRun.Sub(now)
+	log.Printf("⏳ 等待 %.0f 秒至下一个5分钟整点 (%s)", waitDuration.Seconds(), nextRun.Format("15:04"))
+
+	// 等待到第一个整点
+	select {
+	case <-time.After(waitDuration):
+		// 首次执行
+		if err := at.runCycle(); err != nil {
+			log.Printf("❌ 执行失败: %v", err)
+		}
+	case <-at.stopMonitorCh:
+		log.Printf("[%s] ⏹ 收到停止信号，退出自动交易主循环", at.name)
+		return nil
+	}
+
+	// 之后每5分钟执行一次
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 
 	for at.isRunning {
 		select {
@@ -411,7 +451,59 @@ func (at *AutoTrader) runCycle() error {
 	log.Printf("📊 账户净值: %.2f USDT | 可用: %.2f USDT | 持仓: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
-	// 5. 调用AI获取完整决策
+	// 5. 更新K线缓存并检测交易信号
+	log.Println("🔄 更新K线缓存...")
+	for _, coin := range ctx.CandidateCoins {
+		if err := at.klineCache.UpdateSymbol(coin.Symbol); err != nil {
+			log.Printf("⚠️  更新 %s K线缓存失败: %v", coin.Symbol, err)
+		}
+	}
+
+	// 检测所有时间周期的交易信号
+	timeFrames := []market.TimeFrame{
+		market.TimeFrame5m,
+		market.TimeFrame15m,
+		market.TimeFrame30m,
+		market.TimeFrame1h,
+		market.TimeFrame4h,
+		market.TimeFrame1d,
+	}
+
+	log.Println("🔍 检测交易信号中...")
+	var allSignals []*market.TradingSignal
+	for _, coin := range ctx.CandidateCoins {
+		signals := at.signalDetector.DetectAllSignals(coin.Symbol, timeFrames)
+		allSignals = append(allSignals, signals...)
+	}
+
+	// 过滤强信号（信心度>=80）
+	strongSignals := market.FilterStrongSignals(allSignals)
+
+	if len(strongSignals) > 0 {
+		log.Printf("🎯 检测到 %d 个强交易信号 (信心度≥80%%)", len(strongSignals))
+		for _, sig := range strongSignals {
+			log.Printf("   └─ %s %s | %s | 方向:%s | 价格:%.4f | 止损:%.4f | 强度:%d%%",
+				sig.Symbol, sig.TimeFrame, sig.SignalType, sig.Direction, sig.Price, sig.StopLoss, sig.Confidence)
+		}
+	} else if len(allSignals) > 0 {
+		log.Printf("📊 检测到 %d 个信号，但强度不足80%%", len(allSignals))
+	} else {
+		log.Println("⚪ 未检测到交易信号")
+	}
+
+	// 决策是否调用AI：有强信号或有持仓需要管理
+	shouldCallAI := len(strongSignals) > 0 || ctx.Account.PositionCount > 0
+
+	if !shouldCallAI {
+		log.Println("⏸ 无交易信号且无持仓，跳过本周期")
+		record.ExecutionLog = append(record.ExecutionLog, "无交易信号且无持仓，跳过本周期")
+		if err := at.decisionLogger.LogDecision(record); err != nil {
+			log.Printf("⚠ 保存决策记录失败: %v", err)
+		}
+		return nil
+	}
+
+	// 6. 调用AI获取完整决策
 	log.Printf("🤖 正在请求AI分析并决策... [模板: %s]", at.systemPromptTemplate)
 	decision, err := decision.GetFullDecisionWithCustomPrompt(ctx, at.mcpClient, at.customPrompt, at.overrideBasePrompt, at.systemPromptTemplate)
 
@@ -725,6 +817,14 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📈 开多仓: %s", decision.Symbol)
 
+	// ⚠️ 验证止盈止损必须提供
+	if decision.StopLoss <= 0 {
+		return fmt.Errorf("❌ 拒绝开仓: 必须设置止损价格（当前stop_loss=%.2f）", decision.StopLoss)
+	}
+	if decision.TakeProfit <= 0 {
+		return fmt.Errorf("❌ 拒绝开仓: 必须设置止盈价格（当前take_profit=%.2f）", decision.TakeProfit)
+	}
+
 	// ⚠️ 关键：检查是否已有同币种同方向持仓，如果有则拒绝开仓（防止仓位叠加超限）
 	positions, err := at.trader.GetPositions()
 	if err == nil {
@@ -773,7 +873,24 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		// 继续执行，不影响交易
 	}
 
-	// 开仓
+	// 记录开仓时间
+	posKey := decision.Symbol + "_long"
+	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
+
+	// ✅ Backpack专用：使用带保护的开仓方法（分步执行：开仓→等待成交→设置止盈止损）
+	if backpackTrader, ok := at.trader.(*BackpackTrader); ok {
+		err := backpackTrader.OpenLongWithProtection(decision.Symbol, quantity, decision.Leverage, decision.StopLoss, decision.TakeProfit)
+		if err != nil {
+			return err
+		}
+		// 记录止损止盈价格
+		at.positionStopLoss[posKey] = decision.StopLoss
+		at.positionTakeProfit[posKey] = decision.TakeProfit
+		log.Printf("  ✓ 开仓成功（Backpack专用流程），数量: %.4f", quantity)
+		return nil
+	}
+
+	// ✅ 其他交易所：使用标准流程
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
 		return err
@@ -785,10 +902,6 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
-
-	// 记录开仓时间
-	posKey := decision.Symbol + "_long"
-	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
@@ -808,6 +921,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 // executeOpenShortWithRecord 执行开空仓并记录详细信息
 func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📉 开空仓: %s", decision.Symbol)
+
+	// ⚠️ 验证止盈止损必须提供
+	if decision.StopLoss <= 0 {
+		return fmt.Errorf("❌ 拒绝开仓: 必须设置止损价格（当前stop_loss=%.2f）", decision.StopLoss)
+	}
+	if decision.TakeProfit <= 0 {
+		return fmt.Errorf("❌ 拒绝开仓: 必须设置止盈价格（当前take_profit=%.2f）", decision.TakeProfit)
+	}
 
 	// ⚠️ 关键：检查是否已有同币种同方向持仓，如果有则拒绝开仓（防止仓位叠加超限）
 	positions, err := at.trader.GetPositions()
@@ -857,7 +978,24 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		// 继续执行，不影响交易
 	}
 
-	// 开仓
+	// 记录开仓时间
+	posKey := decision.Symbol + "_short"
+	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
+
+	// ✅ Backpack专用：使用带保护的开仓方法（分步执行：开仓→等待成交→设置止盈止损）
+	if backpackTrader, ok := at.trader.(*BackpackTrader); ok {
+		err := backpackTrader.OpenShortWithProtection(decision.Symbol, quantity, decision.Leverage, decision.StopLoss, decision.TakeProfit)
+		if err != nil {
+			return err
+		}
+		// 记录止损止盈价格
+		at.positionStopLoss[posKey] = decision.StopLoss
+		at.positionTakeProfit[posKey] = decision.TakeProfit
+		log.Printf("  ✓ 开仓成功（Backpack专用流程），数量: %.4f", quantity)
+		return nil
+	}
+
+	// ✅ 其他交易所：使用标准流程
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
 		return err
@@ -869,10 +1007,6 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 开仓成功，订单ID: %v, 数量: %.4f", order["orderId"], quantity)
-
-	// 记录开仓时间
-	posKey := decision.Symbol + "_short"
-	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
@@ -1113,6 +1247,11 @@ func (at *AutoTrader) executeUpdateTakeProfitWithRecord(decision *decision.Decis
 func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision, actionRecord *logger.DecisionAction) error {
 	log.Printf("  📊 部分平仓: %s %.1f%%", decision.Symbol, decision.ClosePercentage)
 
+	// ❌ Backpack 交易所禁止部分平仓（会导致反向开仓风险）
+	if _, ok := at.trader.(*BackpackTrader); ok {
+		return fmt.Errorf("❌ Backpack 交易所禁止部分平仓！原因：部分平仓后的止盈止损是独立订单，不会互相取消，可能导致反向开仓。请使用 close_long 或 close_short 全部平仓")
+	}
+
 	// 验证百分比范围
 	if decision.ClosePercentage <= 0 || decision.ClosePercentage > 100 {
 		return fmt.Errorf("平仓百分比必须在 0-100 之间，当前: %.1f", decision.ClosePercentage)
@@ -1209,27 +1348,56 @@ func (at *AutoTrader) executePartialCloseWithRecord(decision *decision.Decision,
 
 	// ✅ Step 4: 恢复止盈止损（防止剩余仓位裸奔）
 	// 重要：币安等交易所在部分平仓后会自动取消原有的 TP/SL 订单（因为数量不匹配）
-	// 如果 AI 提供了新的止损止盈价格，则为剩余仓位重新设置保护
-	if decision.NewStopLoss > 0 {
-		log.Printf("  → 为剩余仓位 %.4f 恢复止损单: %.2f", remainingQuantity, decision.NewStopLoss)
-		err = at.trader.SetStopLoss(decision.Symbol, positionSide, remainingQuantity, decision.NewStopLoss)
-		if err != nil {
-			log.Printf("  ⚠️ 恢复止损失败: %v（不影响平仓结果）", err)
+	// 如果 AI 提供了新的止损止盈价格，则使用新价格；否则使用原有价格自动恢复
+	posKey := fmt.Sprintf("%s_%s", decision.Symbol, strings.ToLower(positionSide))
+
+	// 处理止损
+	stopLossPrice := decision.NewStopLoss
+	if stopLossPrice <= 0 {
+		// AI 未提供新止损，尝试使用原始止损价格
+		if originalStopLoss, exists := at.positionStopLoss[posKey]; exists && originalStopLoss > 0 {
+			stopLossPrice = originalStopLoss
+			log.Printf("  → AI未提供新止损，自动使用原止损价格: %.2f", stopLossPrice)
 		}
 	}
 
-	if decision.NewTakeProfit > 0 {
-		log.Printf("  → 为剩余仓位 %.4f 恢复止盈单: %.2f", remainingQuantity, decision.NewTakeProfit)
-		err = at.trader.SetTakeProfit(decision.Symbol, positionSide, remainingQuantity, decision.NewTakeProfit)
+	if stopLossPrice > 0 {
+		log.Printf("  → 为剩余仓位 %.4f 设置止损单: %.2f", remainingQuantity, stopLossPrice)
+		err = at.trader.SetStopLoss(decision.Symbol, positionSide, remainingQuantity, stopLossPrice)
 		if err != nil {
-			log.Printf("  ⚠️ 恢复止盈失败: %v（不影响平仓结果）", err)
+			log.Printf("  ⚠️ 设置止损失败: %v（不影响平仓结果）", err)
+		} else {
+			// 更新缓存的止损价格
+			at.positionStopLoss[posKey] = stopLossPrice
 		}
 	}
 
-	// 如果 AI 没有提供新的止盈止损，记录警告
-	if decision.NewStopLoss <= 0 && decision.NewTakeProfit <= 0 {
-		log.Printf("  ⚠️⚠️⚠️ 警告: 部分平仓后AI未提供新的止盈止损价格")
+	// 处理止盈
+	takeProfitPrice := decision.NewTakeProfit
+	if takeProfitPrice <= 0 {
+		// AI 未提供新止盈，尝试使用原始止盈价格
+		if originalTakeProfit, exists := at.positionTakeProfit[posKey]; exists && originalTakeProfit > 0 {
+			takeProfitPrice = originalTakeProfit
+			log.Printf("  → AI未提供新止盈，自动使用原止盈价格: %.2f", takeProfitPrice)
+		}
+	}
+
+	if takeProfitPrice > 0 {
+		log.Printf("  → 为剩余仓位 %.4f 设置止盈单: %.2f", remainingQuantity, takeProfitPrice)
+		err = at.trader.SetTakeProfit(decision.Symbol, positionSide, remainingQuantity, takeProfitPrice)
+		if err != nil {
+			log.Printf("  ⚠️ 设置止盈失败: %v（不影响平仓结果）", err)
+		} else {
+			// 更新缓存的止盈价格
+			at.positionTakeProfit[posKey] = takeProfitPrice
+		}
+	}
+
+	// 如果止损止盈都无法设置，记录警告
+	if stopLossPrice <= 0 && takeProfitPrice <= 0 {
+		log.Printf("  ⚠️⚠️⚠️ 警告: 部分平仓后无止盈止损保护")
 		log.Printf("  → 剩余仓位 %.4f (价值 %.2f USDT) 目前没有止盈止损保护", remainingQuantity, remainingValue)
+		log.Printf("  → 原因: AI未提供新价格，且系统中无原始价格记录")
 		log.Printf("  → 建议: 在 partial_close 决策中包含 new_stop_loss 和 new_take_profit 字段")
 	}
 
