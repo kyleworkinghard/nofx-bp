@@ -105,14 +105,16 @@ func (kc *KlineCache) InitSymbol(symbol string, maxKlines int) error {
 
 // UpdateSymbol 更新某个交易对的K线数据（增量更新）
 func (kc *KlineCache) UpdateSymbol(symbol string) error {
-	kc.mu.Lock()
-	defer kc.mu.Unlock()
-
+	// 只需要读锁来获取mtk，允许并发更新不同的symbol
+	kc.mu.RLock()
 	mtk, exists := kc.cache[symbol]
+	kc.mu.RUnlock()
+
 	if !exists {
 		return fmt.Errorf("symbol %s not initialized", symbol)
 	}
 
+	// 使用symbol级别的锁，不同symbol可以并发更新
 	mtk.mu.Lock()
 	defer mtk.mu.Unlock()
 
@@ -206,4 +208,42 @@ func (kc *KlineCache) GetLatestKline(symbol string, timeFrame TimeFrame) (*Kline
 // GetLatestTwoKlines 获取最新的两根K线（用于比较）
 func (kc *KlineCache) GetLatestTwoKlines(symbol string, timeFrame TimeFrame) ([]Kline, error) {
 	return kc.GetKlines(symbol, timeFrame, 2)
+}
+
+// GetCompletedTimeFrames 根据当前时间判断哪些K线周期刚刚完成
+// 只返回已完成的周期，避免检测未完成K线导致误判
+// 注意：已移除5m周期检测（准确率太低）
+func GetCompletedTimeFrames(now time.Time) []TimeFrame {
+	minute := now.Minute()
+	hour := now.Hour()
+
+	var completed []TimeFrame
+
+	// 15m周期：每15分钟完成一次（:00, :15, :30, :45）
+	if minute%15 == 0 {
+		completed = append(completed, TimeFrame15m)
+	}
+
+	// 30m周期：每30分钟完成一次（:00, :30）
+	if minute%30 == 0 {
+		completed = append(completed, TimeFrame30m)
+	}
+
+	// 1h周期：每小时整点完成（:00）
+	if minute == 0 {
+		completed = append(completed, TimeFrame1h)
+	}
+
+	// 4h周期：每4小时完成一次（Binance标准：00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC）
+	if minute == 0 && hour%4 == 0 {
+		completed = append(completed, TimeFrame4h)
+	}
+
+	// 1d周期：每天00:00 UTC完成（需要考虑时区，如果是北京时间则是08:00）
+	// 这里假设系统时间是UTC或已正确配置时区
+	if minute == 0 && hour == 0 {
+		completed = append(completed, TimeFrame1d)
+	}
+
+	return completed
 }

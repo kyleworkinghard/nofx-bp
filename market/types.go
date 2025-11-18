@@ -15,6 +15,8 @@ type Data struct {
 	FundingRate       float64
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
+	// 多周期K线数据（用于信号验证）
+	MultiTimeFrameKlines map[TimeFrame]*TimeFrameData
 }
 
 // OIData Open Interest数据
@@ -44,6 +46,18 @@ type LongerTermData struct {
 	AverageVolume float64
 	MACDValues    []float64
 	RSI14Values   []float64
+}
+
+// TimeFrameData 单个时间周期的K线和指标数据
+type TimeFrameData struct {
+	TimeFrame  string    // 5m, 15m, 30m, 1h, 4h
+	Klines     []Kline   // 最近的K线数据（最多显示10根）
+	EMA20      float64   // 当前EMA20
+	MACD       float64   // 当前MACD
+	RSI14      float64   // 当前RSI14
+	ATR14      float64   // 当前ATR14
+	Volume     float64   // 当前成交量
+	AvgVolume  float64   // 平均成交量
 }
 
 // Binance API 响应结构

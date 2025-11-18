@@ -300,25 +300,25 @@ func (at *AutoTrader) Run() error {
 	waitDuration := nextRun.Sub(now)
 	log.Printf("⏳ 等待 %.0f 秒至下一个5分钟整点 (%s)", waitDuration.Seconds(), nextRun.Format("15:04"))
 
-	// 等待到第一个整点
-	select {
-	case <-time.After(waitDuration):
-		// 首次执行
-		if err := at.runCycle(); err != nil {
-			log.Printf("❌ 执行失败: %v", err)
-		}
-	case <-at.stopMonitorCh:
-		log.Printf("[%s] ⏹ 收到停止信号，退出自动交易主循环", at.name)
-		return nil
-	}
-
-	// 之后每5分钟执行一次
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
+	// 主循环：每次都重新计算下一个整点，确保对齐
 	for at.isRunning {
+		// 计算下一个5分钟整点
+		now := time.Now()
+		nextMinute := ((now.Minute() / 5) + 1) * 5
+		if nextMinute >= 60 {
+			nextMinute = 0
+		}
+		nextRun := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), nextMinute, 0, 0, now.Location())
+		if nextRun.Before(now) {
+			nextRun = nextRun.Add(time.Hour)
+		}
+
+		waitDuration := nextRun.Sub(now)
+
+		// 等待到下一个整点
 		select {
-		case <-ticker.C:
+		case <-time.After(waitDuration):
+			// 执行交易周期
 			if err := at.runCycle(); err != nil {
 				log.Printf("❌ 执行失败: %v", err)
 			}
@@ -451,29 +451,32 @@ func (at *AutoTrader) runCycle() error {
 	log.Printf("📊 账户净值: %.2f USDT | 可用: %.2f USDT | 持仓: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
-	// 5. 更新K线缓存并检测交易信号
-	log.Println("🔄 更新K线缓存...")
-	for _, coin := range ctx.CandidateCoins {
-		if err := at.klineCache.UpdateSymbol(coin.Symbol); err != nil {
-			log.Printf("⚠️  更新 %s K线缓存失败: %v", coin.Symbol, err)
-		}
-	}
+	// 5. 更新K线缓存并检测交易信号（并发更新，限流6个请求）
+	log.Println("🔄 并发更新K线缓存...")
+	at.updateKlinesParallel(ctx.CandidateCoins)
 
-	// 检测所有时间周期的交易信号
-	timeFrames := []market.TimeFrame{
-		market.TimeFrame5m,
-		market.TimeFrame15m,
-		market.TimeFrame30m,
-		market.TimeFrame1h,
-		market.TimeFrame4h,
-		market.TimeFrame1d,
-	}
-
-	log.Println("🔍 检测交易信号中...")
+	// 获取当前已完成的K线周期（严格模式：只检测已完成的K线，避免误判）
+	completedTimeFrames := market.GetCompletedTimeFrames(time.Now())
 	var allSignals []*market.TradingSignal
-	for _, coin := range ctx.CandidateCoins {
-		signals := at.signalDetector.DetectAllSignals(coin.Symbol, timeFrames)
-		allSignals = append(allSignals, signals...)
+
+	if len(completedTimeFrames) == 0 {
+		log.Println("⚪ 当前时间点无已完成的K线周期，跳过信号检测")
+		// 如果有持仓，仍然需要调用AI管理持仓
+		if ctx.Account.PositionCount > 0 {
+			log.Println("💼 有持仓需要管理，继续调用AI...")
+		} else {
+			record.ExecutionLog = append(record.ExecutionLog, "无已完成K线周期且无持仓，跳过本周期")
+			if err := at.decisionLogger.LogDecision(record); err != nil {
+				log.Printf("⚠ 保存决策记录失败: %v", err)
+			}
+			return nil
+		}
+	} else {
+		log.Printf("🔍 检测交易信号中... (已完成周期: %v)", completedTimeFrames)
+		for _, coin := range ctx.CandidateCoins {
+			signals := at.signalDetector.DetectAllSignals(coin.Symbol, completedTimeFrames)
+			allSignals = append(allSignals, signals...)
+		}
 	}
 
 	// 过滤强信号（信心度>=80）
@@ -490,6 +493,9 @@ func (at *AutoTrader) runCycle() error {
 	} else {
 		log.Println("⚪ 未检测到交易信号")
 	}
+
+	// 将强信号添加到上下文，传递给AI
+	ctx.StrongSignals = strongSignals
 
 	// 决策是否调用AI：有强信号或有持仓需要管理
 	shouldCallAI := len(strongSignals) > 0 || ctx.Account.PositionCount > 0
@@ -624,15 +630,109 @@ func (at *AutoTrader) runCycle() error {
 	return nil
 }
 
-// buildTradingContext 构建交易上下文
-func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
-	// 1. 获取账户信息
-	balance, err := at.trader.GetBalance()
-	if err != nil {
-		return nil, fmt.Errorf("获取账户余额失败: %w", err)
+// updateKlinesParallel 并发更新多个交易对的K线数据（带限流）
+func (at *AutoTrader) updateKlinesParallel(coins []decision.CandidateCoin) {
+	if len(coins) == 0 {
+		return
 	}
 
-	// 获取账户字段
+	// 使用带缓冲的channel作为信号量，限制最多6个并发请求
+	semaphore := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+
+	for _, coin := range coins {
+		wg.Add(1)
+		go func(symbol string) {
+			defer wg.Done()
+
+			// 获取信号量（如果已有6个在运行，会阻塞等待）
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }() // 释放信号量
+
+			// 更新K线
+			if err := at.klineCache.UpdateSymbol(symbol); err != nil {
+				log.Printf("⚠️  更新 %s K线缓存失败: %v", symbol, err)
+			}
+		}(coin.Symbol)
+	}
+
+	// 等待所有更新完成
+	wg.Wait()
+}
+
+// buildTradingContext 构建交易上下文（并发获取数据）
+func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
+	// 并发获取账户、持仓、候选币、历史表现
+	var (
+		balance        map[string]interface{}
+		positions      []map[string]interface{}
+		candidateCoins []decision.CandidateCoin
+		performance    *logger.PerformanceAnalysis
+		wg             sync.WaitGroup
+		errs           = make([]error, 4)
+	)
+
+	// 1. 并发获取账户信息
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		balance, err = at.trader.GetBalance()
+		if err != nil {
+			errs[0] = fmt.Errorf("获取账户余额失败: %w", err)
+		}
+	}()
+
+	// 2. 并发获取持仓信息
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		positions, err = at.trader.GetPositions()
+		if err != nil {
+			errs[1] = fmt.Errorf("获取持仓失败: %w", err)
+		}
+	}()
+
+	// 3. 并发获取候选币种池
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		candidateCoins, err = at.getCandidateCoins()
+		if err != nil {
+			errs[2] = fmt.Errorf("获取候选币种失败: %w", err)
+		}
+	}()
+
+	// 4. 并发分析历史表现
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		performance, err = at.decisionLogger.AnalyzePerformance(100)
+		if err != nil {
+			log.Printf("⚠️  分析历史表现失败: %v", err)
+			// 不影响主流程，继续执行
+			performance = nil
+		}
+	}()
+
+	// 等待所有并发任务完成
+	wg.Wait()
+
+	// 检查关键错误（账户和持仓是必需的）
+	if errs[0] != nil {
+		return nil, errs[0]
+	}
+	if errs[1] != nil {
+		return nil, errs[1]
+	}
+	if errs[2] != nil {
+		return nil, errs[2]
+	}
+
+	// 处理账户字段
 	totalWalletBalance := 0.0
 	totalUnrealizedProfit := 0.0
 	availableBalance := 0.0
@@ -650,11 +750,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	// Total Equity = 钱包余额 + 未实现盈亏
 	totalEquity := totalWalletBalance + totalUnrealizedProfit
 
-	// 2. 获取持仓信息
-	positions, err := at.trader.GetPositions()
-	if err != nil {
-		return nil, fmt.Errorf("获取持仓失败: %w", err)
-	}
+	// 处理持仓信息
 
 	var positionInfos []decision.PositionInfo
 	totalMarginUsed := 0.0
@@ -681,9 +777,13 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		liquidationPrice := pos["liquidationPrice"].(float64)
 
 		// 计算占用保证金（基于开仓价）
-		leverage := 10 // 默认值，实际应该从持仓信息获取
+		// 优先从持仓信息获取，如果没有则根据币种使用配置的杠杆
+		leverage := at.config.AltcoinLeverage // 默认使用山寨币配置杠杆
+		if symbol == "BTCUSDT" || symbol == "ETHUSDT" {
+			leverage = at.config.BTCETHLeverage // BTC/ETH使用配置的杠杆
+		}
 		if lev, ok := pos["leverage"].(float64); ok {
-			leverage = int(lev)
+			leverage = int(lev) // API返回的leverage优先
 		}
 		marginUsed := (quantity * entryPrice) / float64(leverage)
 		totalMarginUsed += marginUsed
@@ -736,13 +836,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		}
 	}
 
-	// 3. 获取交易员的候选币种池
-	candidateCoins, err := at.getCandidateCoins()
-	if err != nil {
-		return nil, fmt.Errorf("获取候选币种失败: %w", err)
-	}
-
-	// 4. 计算总盈亏
+	// 3. 计算总盈亏
 	totalPnL := totalEquity - at.initialBalance
 	totalPnLPct := 0.0
 	if at.initialBalance > 0 {
@@ -754,16 +848,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		marginUsedPct = (totalMarginUsed / totalEquity) * 100
 	}
 
-	// 5. 分析历史表现（最近100个周期，避免长期持仓的交易记录丢失）
-	// 假设每3分钟一个周期，100个周期 = 5小时，足够覆盖大部分交易
-	performance, err := at.decisionLogger.AnalyzePerformance(100)
-	if err != nil {
-		log.Printf("⚠️  分析历史表现失败: %v", err)
-		// 不影响主流程，继续执行（但设置performance为nil以避免传递错误数据）
-		performance = nil
-	}
-
-	// 6. 构建上下文
+	// 4. 构建上下文（candidateCoins和performance已并发获取）
 	ctx := &decision.Context{
 		CurrentTime:     time.Now().Format("2006-01-02 15:04:05"),
 		RuntimeMinutes:  int(time.Since(at.startTime).Minutes()),

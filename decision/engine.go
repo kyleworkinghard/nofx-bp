@@ -76,17 +76,18 @@ type OITopData struct {
 
 // Context 交易上下文（传递给AI的完整信息）
 type Context struct {
-	CurrentTime     string                  `json:"current_time"`
-	RuntimeMinutes  int                     `json:"runtime_minutes"`
-	CallCount       int                     `json:"call_count"`
-	Account         AccountInfo             `json:"account"`
-	Positions       []PositionInfo          `json:"positions"`
-	CandidateCoins  []CandidateCoin         `json:"candidate_coins"`
-	MarketDataMap   map[string]*market.Data `json:"-"` // 不序列化，但内部使用
-	OITopDataMap    map[string]*OITopData   `json:"-"` // OI Top数据映射
-	Performance     interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
-	BTCETHLeverage  int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
-	AltcoinLeverage int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	CurrentTime     string                    `json:"current_time"`
+	RuntimeMinutes  int                       `json:"runtime_minutes"`
+	CallCount       int                       `json:"call_count"`
+	Account         AccountInfo               `json:"account"`
+	Positions       []PositionInfo            `json:"positions"`
+	CandidateCoins  []CandidateCoin           `json:"candidate_coins"`
+	MarketDataMap   map[string]*market.Data   `json:"-"` // 不序列化，但内部使用
+	OITopDataMap    map[string]*OITopData     `json:"-"` // OI Top数据映射
+	Performance     interface{}               `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
+	BTCETHLeverage  int                       `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
+	AltcoinLeverage int                       `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	StrongSignals   []*market.TradingSignal   `json:"-"` // 系统检测的强交易信号（信心度≥80%）
 }
 
 // Decision AI的交易决策
@@ -330,9 +331,8 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	// 2. 硬约束（风险控制）- 动态生成
 	sb.WriteString("# 硬约束（风险控制）\n\n")
 	sb.WriteString("1. 风险回报比: 必须 ≥ 1:3（冒1%风险，赚3%+收益）\n")
-	sb.WriteString("2. 最多持仓: 3个币种（质量>数量）\n")
-	sb.WriteString(fmt.Sprintf("3. 单币仓位上限: 山寨%.0f U | BTC/ETH %.0f U（基于净值的仓位上限，实际开仓还需考虑可用余额）\n",
-		accountEquity*4.5, accountEquity*10))
+	sb.WriteString("2. 最多持仓: 2个币种（质量>数量）\n")
+	sb.WriteString(fmt.Sprintf("3. 单币仓位上限: 山寨%.0f U | BTC/ETH %.0f U（基于净值的仓位上限，实际开仓还需考虑可用余额）\n", accountEquity*4.5, accountEquity*10))
 	sb.WriteString(fmt.Sprintf("4. 杠杆限制: **山寨币最大%dx杠杆** | **BTC/ETH最大%dx杠杆** (⚠️ 严格执行，不可超过)\n", altcoinLeverage, btcEthLeverage))
 	sb.WriteString("5. 保证金: 总使用率 ≤ 90%\n")
 	sb.WriteString("6. 开仓金额: 建议 **≥12 USDT** (交易所最小名义价值 10 USDT + 安全边际)\n")
@@ -367,6 +367,61 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 // buildUserPrompt 构建 User Prompt（动态数据）
 func buildUserPrompt(ctx *Context) string {
 	var sb strings.Builder
+
+	// ⚠️ 强制规则：只能使用系统检测的信号
+	sb.WriteString("# ⚠️ 重要规则（必须遵守）\n\n")
+	sb.WriteString("**你只能根据下方\"系统检测的交易信号\"来开仓，禁止自己分析K线数据。**\n\n")
+	sb.WriteString("- ✅ 允许：根据系统检测的Pin Bar/吞没/十字星信号开仓\n")
+	sb.WriteString("- ✅ 允许：使用RSI/MACD/成交量等指标评估信号强度\n")
+	sb.WriteString("- ❌ 禁止：自己分析K线序列发现\"潜在的\"形态\n")
+	sb.WriteString("- ❌ 禁止：仅凭RSI超买/超卖就开仓\n")
+	sb.WriteString("- ❌ 禁止：仅凭价格接近支撑/阻力就开仓\n\n")
+	sb.WriteString("**如果没有系统检测的信号，或信号方向与你的判断相反，则输出wait。**\n\n")
+	sb.WriteString("---\n\n")
+
+	// 📖 信号判断标准说明
+	sb.WriteString("## 📖 系统信号检测标准（了解系统如何识别信号）\n\n")
+	sb.WriteString("**检测周期**：系统仅在 **15m、30m、1h、4h** 周期检测信号（已移除5m，准确率太低）\n\n")
+	sb.WriteString("系统使用以下严格标准检测三种反转形态信号：\n\n")
+
+	sb.WriteString("### 1. Pin Bar（针状线/锤子线）\n")
+	sb.WriteString("**看涨Pin Bar（做多）**：\n")
+	sb.WriteString("- 长下影线：影线长度 > 实体长度 × 3\n")
+	sb.WriteString("- 小实体：实体大小 < K线总长度 × 20%\n")
+	sb.WriteString("- 收盘价接近最高价（阳线更强）\n")
+	sb.WriteString("- 成交量放大（> 前5根平均成交量1.5倍）\n")
+	sb.WriteString("- 出现在下跌趋势末端\n\n")
+
+	sb.WriteString("**看跌Pin Bar（做空）**：\n")
+	sb.WriteString("- 长上影线：影线长度 > 实体长度 × 3\n")
+	sb.WriteString("- 小实体：实体大小 < K线总长度 × 20%\n")
+	sb.WriteString("- 收盘价接近最低价\n")
+	sb.WriteString("- 成交量放大\n")
+	sb.WriteString("- 出现在上涨趋势末端\n\n")
+
+	sb.WriteString("### 2. 吞没形态（Engulfing）\n")
+	sb.WriteString("**看涨吞没（做多）**：\n")
+	sb.WriteString("- 第一根：小阴线（下跌）\n")
+	sb.WriteString("- 第二根：大阳线，完全吞没第一根\n")
+	sb.WriteString("- 第二根开盘价 < 第一根收盘价\n")
+	sb.WriteString("- 第二根收盘价 > 第一根开盘价\n")
+	sb.WriteString("- 第二根成交量 > 第一根成交量1.5倍\n\n")
+
+	sb.WriteString("**看跌吞没（做空）**：\n")
+	sb.WriteString("- 第一根：小阳线（上涨）\n")
+	sb.WriteString("- 第二根：大阴线，完全吞没第一根\n")
+	sb.WriteString("- 第二根开盘价 > 第一根收盘价\n")
+	sb.WriteString("- 第二根收盘价 < 第一根开盘价\n")
+	sb.WriteString("- 第二根成交量放大\n\n")
+
+	sb.WriteString("### 3. 成交量放大标准\n")
+	sb.WriteString("**系统使用以下标准判断成交量是否放大：**\n")
+	sb.WriteString("- 强信号：当前K线成交量 > 前5根平均成交量 × 2倍\n")
+	sb.WriteString("- 中等信号：当前K线成交量 > 前5根平均成交量 × 1.5倍\n")
+	sb.WriteString("- 弱信号：成交量无明显变化（系统不会标记为强信号）\n\n")
+
+	sb.WriteString("**你的任务**：根据系统已检测到的信号，结合多周期K线数据和RSI/MACD指标，评估信号的质量和开仓时机。\n\n")
+	sb.WriteString("---\n\n")
 
 	// 系统状态
 	sb.WriteString(fmt.Sprintf("时间: %s | 周期: #%d | 运行: %d分钟\n\n",
@@ -425,26 +480,106 @@ func buildUserPrompt(ctx *Context) string {
 		sb.WriteString("当前持仓: 无\n\n")
 	}
 
-	// 候选币种（完整市场数据）
-	sb.WriteString(fmt.Sprintf("## 候选币种 (%d个)\n\n", len(ctx.MarketDataMap)))
-	displayedCount := 0
+	// 系统检测的交易信号（最重要的部分！）
+	if len(ctx.StrongSignals) > 0 {
+		sb.WriteString(fmt.Sprintf("## 🎯 系统检测的交易信号 (%d个强信号，信心度≥80%%)\n\n", len(ctx.StrongSignals)))
+		sb.WriteString("**⚠️ 只能根据以下信号开仓，禁止自己分析K线！**\n\n")
+
+		for i, sig := range ctx.StrongSignals {
+			directionCN := "做多"
+			if sig.Direction == "short" {
+				directionCN = "做空"
+			}
+
+			signalTypeCN := sig.SignalType
+			switch sig.SignalType {
+			case "bullish_pin_bar":
+				signalTypeCN = "看涨Pin Bar（锤子线）"
+			case "bearish_pin_bar":
+				signalTypeCN = "看跌Pin Bar（倒锤子）"
+			case "engulfing":
+				if sig.Direction == "long" {
+					signalTypeCN = "看涨吞没"
+				} else {
+					signalTypeCN = "看跌吞没"
+				}
+			case "volume_spike":
+				signalTypeCN = "成交量放大"
+			}
+
+			sb.WriteString(fmt.Sprintf("%d. **%s** %s | %s | 价格%.4f | 止损%.4f | 信心度%d%%\n",
+				i+1, sig.Symbol, sig.TimeFrame, signalTypeCN, sig.Price, sig.StopLoss, sig.Confidence))
+			sb.WriteString(fmt.Sprintf("   → 建议方向: %s\n\n", directionCN))
+		}
+		sb.WriteString("---\n\n")
+	} else {
+		sb.WriteString("## 🎯 系统检测的交易信号\n\n")
+		sb.WriteString("**当前没有检测到新的强信号（信心度≥80%）。**\n\n")
+
+		// 根据是否有持仓给出不同的指示
+		if len(ctx.Positions) > 0 {
+			sb.WriteString("**虽然无新开仓信号，但你需要管理现有持仓：**\n")
+			sb.WriteString("- 评估持仓盈亏情况，决定是否止盈/止损\n")
+			sb.WriteString("- 查看多周期K线数据，判断技术面是否转向\n")
+			sb.WriteString("- 如有盈利，考虑移动止损保护利润\n")
+			sb.WriteString("- 评估是否需要部分平仓锁定利润\n\n")
+		} else {
+			sb.WriteString("**无持仓且无新信号，建议观望(wait)。**\n\n")
+		}
+
+		sb.WriteString("---\n\n")
+	}
+
+	// 构建有信号的币种集合（用于快速查找）
+	signalSymbols := make(map[string]bool)
+	for _, sig := range ctx.StrongSignals {
+		signalSymbols[sig.Symbol] = true
+	}
+
+	// 分离有信号和无信号的币种
+	var coinsWithSignals []CandidateCoin
+	var coinsWithoutSignals []CandidateCoin
+
 	for _, coin := range ctx.CandidateCoins {
-		marketData, hasData := ctx.MarketDataMap[coin.Symbol]
-		if !hasData {
-			continue
+		if _, hasSignal := signalSymbols[coin.Symbol]; hasSignal {
+			coinsWithSignals = append(coinsWithSignals, coin)
+		} else {
+			coinsWithoutSignals = append(coinsWithoutSignals, coin)
 		}
-		displayedCount++
+	}
 
-		sourceTags := ""
-		if len(coin.Sources) > 1 {
-			sourceTags = " (AI500+OI_Top双重信号)"
-		} else if len(coin.Sources) == 1 && coin.Sources[0] == "oi_top" {
-			sourceTags = " (OI_Top持仓增长)"
+	// 显示有信号币种的完整数据
+	if len(coinsWithSignals) > 0 {
+		sb.WriteString(fmt.Sprintf("## 📊 信号币种详细数据 (%d个)\n\n", len(coinsWithSignals)))
+		sb.WriteString("**以下币种检测到强信号，可用于评估信号强度和设置止损止盈：**\n\n")
+
+		for i, coin := range coinsWithSignals {
+			marketData, hasData := ctx.MarketDataMap[coin.Symbol]
+			if !hasData {
+				continue
+			}
+
+			sb.WriteString(fmt.Sprintf("### %d. %s\n\n", i+1, coin.Symbol))
+			sb.WriteString(market.Format(marketData))
+			sb.WriteString("\n")
 		}
+	}
 
-		// 使用FormatMarketData输出完整市场数据
-		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
-		sb.WriteString(market.Format(marketData))
+	// 显示无信号币种的简要概览
+	if len(coinsWithoutSignals) > 0 {
+		sb.WriteString(fmt.Sprintf("## 📈 其他候选币种概览 (%d个无信号)\n\n", len(coinsWithoutSignals)))
+		sb.WriteString("**以下币种无强信号，仅供市场背景参考，不可开仓：**\n\n")
+
+		for _, coin := range coinsWithoutSignals {
+			marketData, hasData := ctx.MarketDataMap[coin.Symbol]
+			if !hasData {
+				continue
+			}
+
+			// 使用已有的价格和涨跌幅数据
+			sb.WriteString(fmt.Sprintf("- **%s**: %.4f (1h: %+.2f%%, 4h: %+.2f%%)\n",
+				coin.Symbol, marketData.CurrentPrice, marketData.PriceChange1h, marketData.PriceChange4h))
+		}
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")
@@ -737,7 +872,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	if d.Action == "open_long" || d.Action == "open_short" {
 		// 根据币种使用配置的杠杆上限
 		maxLeverage := altcoinLeverage          // 山寨币使用配置的杠杆
-		maxPositionValue := accountEquity * 1.5 // 山寨币最多1.5倍账户净值
+		maxPositionValue := accountEquity * 4.5 // 山寨币最多4.5倍账户净值
 		if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 			maxLeverage = btcEthLeverage          // BTC和ETH使用配置的杠杆
 			maxPositionValue = accountEquity * 10 // BTC/ETH最多10倍账户净值
@@ -777,7 +912,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			if d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" {
 				return fmt.Errorf("BTC/ETH单币种仓位价值不能超过%.0f USDT（10倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
 			} else {
-				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（1.5倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
+				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（4.5倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
 			}
 		}
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {

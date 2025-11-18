@@ -97,18 +97,22 @@ func Get(symbol string) (*Data, error) {
 	// 计算长期数据
 	longerTermData := calculateLongerTermData(klines4h)
 
+	// 获取多周期K线数据（从K线缓存）
+	multiTimeFrameData := fetchMultiTimeFrameData(symbol)
+
 	return &Data{
-		Symbol:            symbol,
-		CurrentPrice:      currentPrice,
-		PriceChange1h:     priceChange1h,
-		PriceChange4h:     priceChange4h,
-		CurrentEMA20:      currentEMA20,
-		CurrentMACD:       currentMACD,
-		CurrentRSI7:       currentRSI7,
-		OpenInterest:      oiData,
-		FundingRate:       fundingRate,
-		IntradaySeries:    intradayData,
-		LongerTermContext: longerTermData,
+		Symbol:               symbol,
+		CurrentPrice:         currentPrice,
+		PriceChange1h:        priceChange1h,
+		PriceChange4h:        priceChange4h,
+		CurrentEMA20:         currentEMA20,
+		CurrentMACD:          currentMACD,
+		CurrentRSI7:          currentRSI7,
+		OpenInterest:         oiData,
+		FundingRate:          fundingRate,
+		IntradaySeries:       intradayData,
+		LongerTermContext:    longerTermData,
+		MultiTimeFrameKlines: multiTimeFrameData,
 	}, nil
 }
 
@@ -408,6 +412,84 @@ func getFundingRate(symbol string) (float64, error) {
 	return rate, nil
 }
 
+// fetchMultiTimeFrameData 从K线缓存获取多周期数据
+func fetchMultiTimeFrameData(symbol string) map[TimeFrame]*TimeFrameData {
+	klineCache := GetKlineCache()
+	result := make(map[TimeFrame]*TimeFrameData)
+
+	// 获取关键周期：15m, 30m, 1h, 4h（移除5m，准确率太低）
+	timeFrames := []TimeFrame{TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h}
+
+	now := time.Now()
+
+	for _, tf := range timeFrames {
+		// 获取该周期的K线数据（最多取最近20根用于计算指标）
+		klines, err := klineCache.GetKlines(symbol, tf, 20)
+		if err != nil || len(klines) == 0 {
+			continue
+		}
+
+		// 获取周期的分钟数
+		periodMinutes, exists := TimeFrameMinutes[tf]
+		if !exists {
+			continue
+		}
+
+		// 过滤掉未完成的K线
+		var completedKlines []Kline
+		for _, k := range klines {
+			// K线完成时间 = 开盘时间 + 周期时长
+			klineEndTime := time.UnixMilli(k.OpenTime).Add(time.Duration(periodMinutes) * time.Minute)
+			// 只保留已完成的K线（完成时间早于当前时间）
+			if klineEndTime.Before(now) || klineEndTime.Equal(now) {
+				completedKlines = append(completedKlines, k)
+			}
+		}
+
+		// 至少需要10根K线才能计算指标
+		if len(completedKlines) < 10 {
+			continue
+		}
+
+		// 只保留最近10根已完成的K线用于显示
+		displayKlines := completedKlines
+		if len(completedKlines) > 10 {
+			displayKlines = completedKlines[len(completedKlines)-10:]
+		}
+
+		// 计算指标（使用已完成的K线）
+		ema20 := calculateEMA(completedKlines, 20)
+		macd := calculateMACD(completedKlines)
+		rsi14 := calculateRSI(completedKlines, 14)
+		atr14 := calculateATR(completedKlines, 14)
+
+		// 计算平均成交量
+		avgVolume := 0.0
+		if len(completedKlines) >= 10 {
+			sum := 0.0
+			for i := len(completedKlines) - 10; i < len(completedKlines); i++ {
+				sum += completedKlines[i].Volume
+			}
+			avgVolume = sum / 10.0
+		}
+
+		currentVolume := completedKlines[len(completedKlines)-1].Volume
+
+		result[tf] = &TimeFrameData{
+			TimeFrame: string(tf),
+			Klines:    displayKlines,
+			EMA20:     ema20,
+			MACD:      macd,
+			RSI14:     rsi14,
+			ATR14:     atr14,
+			Volume:    currentVolume,
+			AvgVolume: avgVolume,
+		}
+	}
+
+	return result
+}
+
 // Format 格式化输出市场数据
 func Format(data *Data) string {
 	var sb strings.Builder
@@ -430,54 +512,42 @@ func Format(data *Data) string {
 
 	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
 
-	if data.IntradaySeries != nil {
-		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")
+	// 输出多周期K线数据（用于信号验证）
+	if len(data.MultiTimeFrameKlines) > 0 {
+		sb.WriteString("Multi-timeframe analysis (for signal verification):\n\n")
 
-		if len(data.IntradaySeries.MidPrices) > 0 {
-			sb.WriteString(fmt.Sprintf("Mid prices: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
-		}
+		// 按周期顺序输出：15m, 30m, 1h, 4h（移除5m，准确率太低）
+		timeFrames := []TimeFrame{TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h}
+		for _, tf := range timeFrames {
+			tfData, exists := data.MultiTimeFrameKlines[tf]
+			if !exists || tfData == nil {
+				continue
+			}
 
-		if len(data.IntradaySeries.EMA20Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA indicators (20‑period): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
-		}
+			sb.WriteString(fmt.Sprintf("【%s Timeframe】\n", tfData.TimeFrame))
 
-		if len(data.IntradaySeries.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
-		}
+			// 输出最近3根K线（OHLCV）
+			if len(tfData.Klines) > 0 {
+				sb.WriteString("Recent candles (Open/High/Low/Close/Volume):\n")
+				for i, k := range tfData.Klines {
+					timestamp := time.UnixMilli(k.OpenTime).Format("15:04")
+					openStr := formatPriceWithDynamicPrecision(k.Open)
+					highStr := formatPriceWithDynamicPrecision(k.High)
+					lowStr := formatPriceWithDynamicPrecision(k.Low)
+					closeStr := formatPriceWithDynamicPrecision(k.Close)
+					volStr := formatPriceWithDynamicPrecision(k.Volume)
 
-		if len(data.IntradaySeries.RSI7Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (7‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
-		}
+					sb.WriteString(fmt.Sprintf("  %d. %s: O=%s H=%s L=%s C=%s V=%s\n",
+						i+1, timestamp, openStr, highStr, lowStr, closeStr, volStr))
+				}
+				sb.WriteString("\n")
+			}
 
-		if len(data.IntradaySeries.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
-		}
-
-		if len(data.IntradaySeries.Volume) > 0 {
-			sb.WriteString(fmt.Sprintf("Volume: %s\n\n", formatFloatSlice(data.IntradaySeries.Volume)))
-		}
-
-		sb.WriteString(fmt.Sprintf("3m ATR (14‑period): %.3f\n\n", data.IntradaySeries.ATR14))
-	}
-
-	if data.LongerTermContext != nil {
-		sb.WriteString("Longer‑term context (4‑hour timeframe):\n\n")
-
-		sb.WriteString(fmt.Sprintf("20‑Period EMA: %.3f vs. 50‑Period EMA: %.3f\n\n",
-			data.LongerTermContext.EMA20, data.LongerTermContext.EMA50))
-
-		sb.WriteString(fmt.Sprintf("3‑Period ATR: %.3f vs. 14‑Period ATR: %.3f\n\n",
-			data.LongerTermContext.ATR3, data.LongerTermContext.ATR14))
-
-		sb.WriteString(fmt.Sprintf("Current Volume: %.3f vs. Average Volume: %.3f\n\n",
-			data.LongerTermContext.CurrentVolume, data.LongerTermContext.AverageVolume))
-
-		if len(data.LongerTermContext.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
-		}
-
-		if len(data.LongerTermContext.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
+			// 输出技术指标
+			sb.WriteString(fmt.Sprintf("Indicators: EMA20=%.3f MACD=%.4f RSI14=%.2f ATR14=%.4f\n",
+				tfData.EMA20, tfData.MACD, tfData.RSI14, tfData.ATR14))
+			sb.WriteString(fmt.Sprintf("Volume: Current=%.0f Avg=%.0f Ratio=%.2f\n\n",
+				tfData.Volume, tfData.AvgVolume, tfData.Volume/tfData.AvgVolume))
 		}
 	}
 

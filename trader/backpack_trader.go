@@ -455,37 +455,44 @@ func (t *BackpackTrader) GetBalance() (map[string]interface{}, error) {
 	//   "collateral": [{"symbol": "USDC", "totalQuantity": "499.9", "availableQuantity": "499.9", ...}]
 	// }
 
-	// 优先使用顶层字段
+	// 初始化变量
 	var totalWalletBalance float64 = 0
 	var availableBalance float64 = 0
 	var totalUnrealizedProfit float64 = 0
 
-	// 获取总净值
+	// 优先从顶层字段读取总净值和未实现盈亏
 	if netEquity, ok := resp["netEquity"].(float64); ok {
 		totalWalletBalance = netEquity
 	}
 
-	// 获取可用净值
-	if netEquityAvailable, ok := resp["netEquityAvailable"].(float64); ok {
-		availableBalance = netEquityAvailable
-	}
-
-	// 获取未实现盈亏
 	if pnlUnrealized, ok := resp["pnlUnrealized"].(float64); ok {
 		totalUnrealizedProfit = pnlUnrealized
 	}
 
-	// 如果顶层字段为空，尝试从 collateral 数组中计算
-	if totalWalletBalance == 0 {
-		if collateralData, ok := resp["collateral"]; ok {
-			if collateralList, ok := collateralData.([]interface{}); ok {
-				for _, item := range collateralList {
-					collateral, ok := item.(map[string]interface{})
-					if !ok {
-						continue
-					}
+	// ⚠️ 可用余额必须从 collateral 数组读取（因为可能有 lending）
+	// 不要使用顶层的 netEquityAvailable，那是净值不是可用余额
+	collateralAvailable := false
+	if collateralData, ok := resp["collateral"]; ok {
+		if collateralList, ok := collateralData.([]interface{}); ok {
+			for _, item := range collateralList {
+				collateral, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
 
-					// 获取总额 (totalQuantity)
+				// 获取可用余额 (availableQuantity) - 这才是真正的可用余额
+				if availableQtyStr, ok := collateral["availableQuantity"].(string); ok {
+					if available, err := strconv.ParseFloat(availableQtyStr, 64); err == nil {
+						availableBalance += available
+						collateralAvailable = true
+					}
+				} else if availableQty, ok := collateral["availableQuantity"].(float64); ok {
+					availableBalance += availableQty
+					collateralAvailable = true
+				}
+
+				// 如果顶层没有总净值，则从 collateral 累加
+				if totalWalletBalance == 0 {
 					if totalQtyStr, ok := collateral["totalQuantity"].(string); ok {
 						if total, err := strconv.ParseFloat(totalQtyStr, 64); err == nil {
 							totalWalletBalance += total
@@ -493,17 +500,15 @@ func (t *BackpackTrader) GetBalance() (map[string]interface{}, error) {
 					} else if totalQty, ok := collateral["totalQuantity"].(float64); ok {
 						totalWalletBalance += totalQty
 					}
-
-					// 获取可用余额 (availableQuantity)
-					if availableQtyStr, ok := collateral["availableQuantity"].(string); ok {
-						if available, err := strconv.ParseFloat(availableQtyStr, 64); err == nil {
-							availableBalance += available
-						}
-					} else if availableQty, ok := collateral["availableQuantity"].(float64); ok {
-						availableBalance += availableQty
-					}
 				}
 			}
+		}
+	}
+
+	// 如果 collateral 数组中没有可用余额，才使用顶层的 netEquityAvailable（兜底）
+	if !collateralAvailable {
+		if netEquityAvailable, ok := resp["netEquityAvailable"].(float64); ok {
+			availableBalance = netEquityAvailable
 		}
 	}
 
@@ -580,12 +585,8 @@ func (t *BackpackTrader) GetPositions() ([]map[string]interface{}, error) {
 		liquidationPriceStr, _ := pos["liquidationPrice"].(string)
 		liquidationPrice, _ := strconv.ParseFloat(liquidationPriceStr, 64)
 
-		// 获取杠杆（Backpack可能不直接提供，使用默认值）
-		leverage := 1.0
-		if lev, ok := pos["leverage"].(float64); ok {
-			leverage = lev
-		}
-
+		// 获取杠杆（Backpack可能不直接提供）
+		// 注意：不要设置默认值，让调用方根据币种使用配置的杠杆
 		position := map[string]interface{}{
 			"symbol":            symbol,
 			"side":              side,
@@ -594,7 +595,11 @@ func (t *BackpackTrader) GetPositions() ([]map[string]interface{}, error) {
 			"markPrice":         markPrice,
 			"unRealizedProfit":  unrealizedPnL,
 			"liquidationPrice":  liquidationPrice,
-			"leverage":          leverage,
+		}
+
+		// 只有Backpack API明确返回leverage时才设置（避免错误的默认值）
+		if lev, ok := pos["leverage"].(float64); ok {
+			position["leverage"] = lev
 		}
 
 		positions = append(positions, position)
