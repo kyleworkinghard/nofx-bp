@@ -19,6 +19,8 @@ type Provider string
 const (
 	ProviderDeepSeek Provider = "deepseek"
 	ProviderQwen     Provider = "qwen"
+	ProviderClaude   Provider = "claude"
+	ProviderGemini   Provider = "gemini"
 	ProviderCustom   Provider = "custom"
 )
 
@@ -105,6 +107,56 @@ func (client *Client) SetQwenAPIKey(apiKey string, customURL string, customModel
 	}
 }
 
+// SetClaudeAPIKey 设置Anthropic Claude API密钥
+// customURL 为空时使用默认URL，customModel 为空时使用默认模型
+func (client *Client) SetClaudeAPIKey(apiKey string, customURL string, customModel string) {
+	client.Provider = ProviderClaude
+	client.APIKey = apiKey
+	if customURL != "" {
+		client.BaseURL = customURL
+		log.Printf("🔧 [MCP] Claude 使用自定义 BaseURL: %s", customURL)
+	} else {
+		client.BaseURL = "https://api.anthropic.com/v1"
+		log.Printf("🔧 [MCP] Claude 使用默认 BaseURL: %s", client.BaseURL)
+	}
+	if customModel != "" {
+		client.Model = customModel
+		log.Printf("🔧 [MCP] Claude 使用自定义 Model: %s", customModel)
+	} else {
+		client.Model = "claude-3-5-sonnet-20241022"
+		log.Printf("🔧 [MCP] Claude 使用默认 Model: %s", client.Model)
+	}
+	// 打印 API Key 的前后各4位用于验证
+	if len(apiKey) > 8 {
+		log.Printf("🔧 [MCP] Claude API Key: %s...%s", apiKey[:4], apiKey[len(apiKey)-4:])
+	}
+}
+
+// SetGeminiAPIKey 设置Google Gemini API密钥
+// customURL 为空时使用默认URL，customModel 为空时使用默认模型
+func (client *Client) SetGeminiAPIKey(apiKey string, customURL string, customModel string) {
+	client.Provider = ProviderGemini
+	client.APIKey = apiKey
+	if customURL != "" {
+		client.BaseURL = customURL
+		log.Printf("🔧 [MCP] Gemini 使用自定义 BaseURL: %s", customURL)
+	} else {
+		client.BaseURL = "https://generativelanguage.googleapis.com/v1beta"
+		log.Printf("🔧 [MCP] Gemini 使用默认 BaseURL: %s", client.BaseURL)
+	}
+	if customModel != "" {
+		client.Model = customModel
+		log.Printf("🔧 [MCP] Gemini 使用自定义 Model: %s", customModel)
+	} else {
+		client.Model = "gemini-2.0-flash-exp"
+		log.Printf("🔧 [MCP] Gemini 使用默认 Model: %s", client.Model)
+	}
+	// 打印 API Key 的前后各4位用于验证
+	if len(apiKey) > 8 {
+		log.Printf("🔧 [MCP] Gemini API Key: %s...%s", apiKey[:4], apiKey[len(apiKey)-4:])
+	}
+}
+
 // SetCustomAPI 设置自定义OpenAI兼容API
 func (client *Client) SetCustomAPI(apiURL, apiKey, modelName string) {
 	client.Provider = ProviderCustom
@@ -183,6 +235,19 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 		log.Printf("   API Key: %s...%s", client.APIKey[:4], client.APIKey[len(client.APIKey)-4:])
 	}
 
+	// 根据不同的 Provider 使用不同的 API 格式
+	switch client.Provider {
+	case ProviderClaude:
+		return client.callClaude(systemPrompt, userPrompt)
+	case ProviderGemini:
+		return client.callGemini(systemPrompt, userPrompt)
+	default:
+		return client.callOpenAICompatible(systemPrompt, userPrompt)
+	}
+}
+
+// callOpenAICompatible 调用 OpenAI 兼容的 API（DeepSeek, Qwen, Custom）
+func (client *Client) callOpenAICompatible(systemPrompt, userPrompt string) (string, error) {
 	// 构建 messages 数组
 	messages := []map[string]string{}
 
@@ -208,9 +273,6 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 		"max_tokens":  client.MaxTokens,
 	}
 
-	// 注意：response_format 参数仅 OpenAI 支持，DeepSeek/Qwen 不支持
-	// 我们通过强化 prompt 和后处理来确保 JSON 格式正确
-
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", fmt.Errorf("序列化请求失败: %w", err)
@@ -219,10 +281,8 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	// 创建HTTP请求
 	var url string
 	if client.UseFullURL {
-		// 使用完整URL，不添加/chat/completions
 		url = client.BaseURL
 	} else {
-		// 默认行为：添加/chat/completions
 		url = fmt.Sprintf("%s/chat/completions", client.BaseURL)
 	}
 	log.Printf("📡 [MCP] 请求 URL: %s", url)
@@ -233,18 +293,7 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-
-	// 根据不同的Provider设置认证方式
-	switch client.Provider {
-	case ProviderDeepSeek:
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
-	case ProviderQwen:
-		// 阿里云Qwen使用API-Key认证
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
-		// 注意：如果使用的不是兼容模式，可能需要不同的认证方式
-	default:
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
-	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
 
 	// 发送请求
 	httpClient := &http.Client{Timeout: client.Timeout}
@@ -282,6 +331,163 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	}
 
 	return result.Choices[0].Message.Content, nil
+}
+
+// callClaude 调用 Anthropic Claude API
+func (client *Client) callClaude(systemPrompt, userPrompt string) (string, error) {
+	// Claude API 使用不同的请求格式
+	requestBody := map[string]interface{}{
+		"model":      client.Model,
+		"max_tokens": client.MaxTokens,
+		"messages": []map[string]string{
+			{
+				"role":    "user",
+				"content": userPrompt,
+			},
+		},
+	}
+
+	// Claude 的 system prompt 是单独的字段
+	if systemPrompt != "" {
+		requestBody["system"] = systemPrompt
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("序列化请求失败: %w", err)
+	}
+
+	// Claude API endpoint
+	url := fmt.Sprintf("%s/messages", client.BaseURL)
+	log.Printf("📡 [MCP] Claude 请求 URL: %s", url)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	// Claude 使用特殊的认证方式
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", client.APIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	// 发送请求
+	httpClient := &http.Client{Timeout: client.Timeout}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Claude API返回错误 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// 解析 Claude 响应格式
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("解析Claude响应失败: %w", err)
+	}
+
+	if len(result.Content) == 0 {
+		return "", fmt.Errorf("Claude API返回空响应")
+	}
+
+	return result.Content[0].Text, nil
+}
+
+// callGemini 调用 Google Gemini API
+func (client *Client) callGemini(systemPrompt, userPrompt string) (string, error) {
+	// Gemini API 使用不同的请求格式
+	requestBody := map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"role": "user",
+				"parts": []map[string]string{
+					{"text": userPrompt},
+				},
+			},
+		},
+		"generationConfig": map[string]interface{}{
+			"temperature":     0.5,
+			"maxOutputTokens": client.MaxTokens,
+		},
+	}
+
+	// Gemini 的 system instruction 是单独的字段
+	if systemPrompt != "" {
+		requestBody["systemInstruction"] = map[string]interface{}{
+			"parts": []map[string]string{
+				{"text": systemPrompt},
+			},
+		}
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("序列化请求失败: %w", err)
+	}
+
+	// Gemini API endpoint（API key 在 URL 中）
+	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", client.BaseURL, client.Model, client.APIKey)
+	log.Printf("📡 [MCP] Gemini 请求 URL: %s/models/%s:generateContent", client.BaseURL, client.Model)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// 发送请求
+	httpClient := &http.Client{Timeout: client.Timeout}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Gemini API返回错误 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// 解析 Gemini 响应格式
+	var result struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("解析Gemini响应失败: %w", err)
+	}
+
+	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("Gemini API返回空响应")
+	}
+
+	return result.Candidates[0].Content.Parts[0].Text, nil
 }
 
 // isRetryableError 判断错误是否可重试

@@ -21,9 +21,8 @@ func HookExec[T any](key string, args ...any) *T {
 		log.Printf("🔌 Execute hook: %s", key)
 		res := hook(args...)
 		return res.(*T)
-	} else {
-		log.Printf("🔌 Do not find hook: %s", key)
 	}
+	// Hook不存在时不打印日志，减少噪音
 	var zero *T
 	return zero
 }

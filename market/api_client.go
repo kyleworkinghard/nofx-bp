@@ -7,13 +7,25 @@ import (
 	"log"
 	"net/http"
 	"nofx/hook"
+	"os"
 	"strconv"
 	"time"
 )
 
-const (
-	baseURL = "https://fapi.binance.com"
+var (
+	// 支持通过环境变量 BINANCE_API_URL 配置 API 端点
+	// 默认: https://fapi.binance.com
+	// 可选: https://fapi.binance.us, https://testnet.binancefuture.com (测试网)
+	baseURL = getBaseURL()
 )
+
+func getBaseURL() string {
+	if url := os.Getenv("BINANCE_API_URL"); url != "" {
+		log.Printf("🌐 使用自定义 Binance API 端点: %s", url)
+		return url
+	}
+	return "https://fapi.binance.com"
+}
 
 type APIClient struct {
 	client *http.Client

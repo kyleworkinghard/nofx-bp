@@ -526,10 +526,16 @@ func Format(data *Data) string {
 
 			sb.WriteString(fmt.Sprintf("【%s Timeframe】\n", tfData.TimeFrame))
 
-			// 输出最近3根K线（OHLCV）
+			// 输出最近12根K线（OHLCV）优化：减少数据传输，提高AI响应速度
 			if len(tfData.Klines) > 0 {
 				sb.WriteString("Recent candles (Open/High/Low/Close/Volume):\n")
-				for i, k := range tfData.Klines {
+				// 只取最近12根K线
+				maxKlines := 12
+				startIdx := 0
+				if len(tfData.Klines) > maxKlines {
+					startIdx = len(tfData.Klines) - maxKlines
+				}
+				for i, k := range tfData.Klines[startIdx:] {
 					timestamp := time.UnixMilli(k.OpenTime).Format("15:04")
 					openStr := formatPriceWithDynamicPrecision(k.Open)
 					highStr := formatPriceWithDynamicPrecision(k.High)

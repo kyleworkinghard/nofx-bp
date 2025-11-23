@@ -142,6 +142,22 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		// 使用自定义API
 		mcpClient.SetCustomAPI(config.CustomAPIURL, config.CustomAPIKey, config.CustomModelName)
 		log.Printf("🤖 [%s] 使用自定义AI API: %s (模型: %s)", config.Name, config.CustomAPIURL, config.CustomModelName)
+	} else if config.AIModel == "claude" {
+		// 使用Claude (支持自定义URL和Model)
+		mcpClient.SetClaudeAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
+		if config.CustomAPIURL != "" || config.CustomModelName != "" {
+			log.Printf("🤖 [%s] 使用Anthropic Claude AI (自定义URL: %s, 模型: %s)", config.Name, config.CustomAPIURL, config.CustomModelName)
+		} else {
+			log.Printf("🤖 [%s] 使用Anthropic Claude AI", config.Name)
+		}
+	} else if config.AIModel == "gemini" {
+		// 使用Gemini (支持自定义URL和Model)
+		mcpClient.SetGeminiAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
+		if config.CustomAPIURL != "" || config.CustomModelName != "" {
+			log.Printf("🤖 [%s] 使用Google Gemini AI (自定义URL: %s, 模型: %s)", config.Name, config.CustomAPIURL, config.CustomModelName)
+		} else {
+			log.Printf("🤖 [%s] 使用Google Gemini AI", config.Name)
+		}
 	} else if config.UseQwen || config.AIModel == "qwen" {
 		// 使用Qwen (支持自定义URL和Model)
 		mcpClient.SetQwenAPIKey(config.QwenKey, config.CustomAPIURL, config.CustomModelName)
@@ -483,15 +499,15 @@ func (at *AutoTrader) runCycle() error {
 	strongSignals := market.FilterStrongSignals(allSignals)
 
 	if len(strongSignals) > 0 {
-		log.Printf("🎯 检测到 %d 个强交易信号 (信心度≥80%%)", len(strongSignals))
+		log.Printf("🎯 检测到 %d 个强形态信号 (信心度≥80%%)", len(strongSignals))
 		for _, sig := range strongSignals {
-			log.Printf("   └─ %s %s | %s | 方向:%s | 价格:%.4f | 止损:%.4f | 强度:%d%%",
-				sig.Symbol, sig.TimeFrame, sig.SignalType, sig.Direction, sig.Price, sig.StopLoss, sig.Confidence)
+			log.Printf("   └─ %s %s | %s | 价格:%.4f | 强度:%d%% | %s",
+				sig.Symbol, sig.TimeFrame, sig.SignalType, sig.Price, sig.Confidence, sig.Reason)
 		}
 	} else if len(allSignals) > 0 {
-		log.Printf("📊 检测到 %d 个信号，但强度不足80%%", len(allSignals))
+		log.Printf("📊 检测到 %d 个形态信号，但强度不足80%%", len(allSignals))
 	} else {
-		log.Println("⚪ 未检测到交易信号")
+		log.Println("⚪ 未检测到形态信号")
 	}
 
 	// 将强信号添加到上下文，传递给AI

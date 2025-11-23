@@ -210,8 +210,8 @@ func (t *BackpackTrader) makeAuthenticatedRequest(method, endpoint string, param
 	var req *http.Request
 	method = strings.ToUpper(method)
 
-	if method == "GET" {
-		// GET请求，参数放在URL中
+	if method == "GET" || method == "DELETE" {
+		// GET/DELETE请求，参数放在URL中
 		if len(params) > 0 {
 			queryParams := make([]string, 0, len(params))
 			for k, v := range params {
@@ -223,9 +223,200 @@ func (t *BackpackTrader) makeAuthenticatedRequest(method, endpoint string, param
 				url += "?" + strings.Join(queryParams, "&")
 			}
 		}
-		req, err = http.NewRequest(method, url, nil)
-	} else if method == "POST" || method == "PUT" || method == "DELETE" {
-		// POST/PUT/DELETE请求，参数放在请求体中
+		// DELETE 请求需要空 body
+		var body io.Reader
+		if method == "DELETE" {
+			body = strings.NewReader("{}")
+		}
+		req, err = http.NewRequest(method, url, body)
+	} else if method == "POST" || method == "PUT" {
+		// POST/PUT请求，参数放在请求体中
+		var body io.Reader
+		if len(data) > 0 {
+			jsonData, err := json.Marshal(data)
+			if err != nil {
+				return nil, fmt.Errorf("序列化请求体失败: %w", err)
+			}
+			body = strings.NewReader(string(jsonData))
+		}
+		req, err = http.NewRequest(method, url, body)
+	} else {
+		return nil, fmt.Errorf("不支持的HTTP方法: %s", method)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	// 设置请求头
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// 发送请求
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 检查HTTP状态码
+	if resp.StatusCode != 200 {
+		log.Printf("❌ [Backpack] API错误: %s %s -> HTTP %d", method, endpoint, resp.StatusCode)
+		log.Printf("❌ [Backpack] 错误响应: %s", string(bodyBytes))
+		return nil, fmt.Errorf("API请求失败: HTTP %d - %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// 尝试解析JSON
+	var result map[string]interface{}
+	contentType := resp.Header.Get("Content-Type")
+	if strings.Contains(contentType, "application/json") {
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			// 如果不是JSON，检查是否是纯文本（如订单状态）
+			textResult := string(bodyBytes)
+			if textResult == "New" || textResult == "PartiallyFilled" || textResult == "Filled" {
+				return map[string]interface{}{"status": textResult}, nil
+			}
+			return nil, fmt.Errorf("解析响应失败: %w, 响应: %s", err, string(bodyBytes))
+		}
+	} else {
+		// 纯文本响应
+		textResult := string(bodyBytes)
+		return map[string]interface{}{"text": textResult}, nil
+	}
+
+	return result, nil
+}
+
+// generateSignatureInterface 生成API请求签名（支持interface{}类型）
+func (t *BackpackTrader) generateSignatureInterface(method, endpoint string, params map[string]string, data map[string]interface{}) (map[string]string, error) {
+	// 获取指令类型
+	instructionType := t.determineInstructionType(method, endpoint)
+
+	// 当前时间戳（毫秒）
+	timestamp := time.Now().UnixMilli()
+	window := int64(60000) // 增加到60秒窗口，避免网络延迟导致过期
+
+	// 🐛 调试：打印系统时间
+	log.Printf("🐛 [Backpack] 当前系统时间: %s", time.Now().Format("2006-01-02 15:04:05.000"))
+
+	// 构建签名字符串
+	signatureStr := fmt.Sprintf("instruction=%s", instructionType)
+
+	// 添加查询参数（按字母顺序排序）
+	if len(params) > 0 {
+		keys := make([]string, 0, len(params))
+		for k := range params {
+			if params[k] != "" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			signatureStr += fmt.Sprintf("&%s=%s", k, params[k])
+		}
+	}
+
+	// 添加请求体参数（按字母顺序排序）- 支持interface{}类型
+	if len(data) > 0 {
+		keys := make([]string, 0, len(data))
+		for k := range data {
+			if data[k] != nil && data[k] != "" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			// 将interface{}转换为字符串用于签名
+			var valueStr string
+			switch v := data[k].(type) {
+			case string:
+				valueStr = v
+			case bool:
+				valueStr = fmt.Sprintf("%t", v)
+			case int, int64, float64:
+				valueStr = fmt.Sprintf("%v", v)
+			default:
+				valueStr = fmt.Sprintf("%v", v)
+			}
+			if valueStr != "" {
+				signatureStr += fmt.Sprintf("&%s=%s", k, valueStr)
+			}
+		}
+	}
+
+	// 添加时间戳和窗口
+	signatureStr += fmt.Sprintf("&timestamp=%d&window=%d", timestamp, window)
+
+	// 🐛 调试：打印签名字符串
+	log.Printf("🐛 [Backpack] 签名字符串: %s", signatureStr)
+	log.Printf("🐛 [Backpack] 时间戳: %d, 窗口: %d", timestamp, window)
+
+	// 使用ED25519签名
+	messageBytes := []byte(signatureStr)
+	signature := ed25519.Sign(t.privateKey, messageBytes)
+
+	// Base64编码签名
+	signatureB64 := base64.StdEncoding.EncodeToString(signature)
+
+	// 构建请求头
+	headers := map[string]string{
+		"X-API-KEY":    t.apiKey,
+		"X-SIGNATURE":  signatureB64,
+		"X-TIMESTAMP":  fmt.Sprintf("%d", timestamp),
+		"X-WINDOW":     fmt.Sprintf("%d", window),
+		"Content-Type": "application/json",
+	}
+
+	// 🐛 调试：打印请求头（隐藏敏感信息）
+	log.Printf("🐛 [Backpack] 请求头: X-TIMESTAMP=%d, X-WINDOW=%d", timestamp, window)
+	log.Printf("🐛 [Backpack] 签名（前20字符）: %s...", signatureB64[:min(20, len(signatureB64))])
+
+	return headers, nil
+}
+
+// makeAuthenticatedRequestInterface 发起需要认证的API请求（支持interface{}类型）
+func (t *BackpackTrader) makeAuthenticatedRequestInterface(method, endpoint string, params map[string]string, data map[string]interface{}) (map[string]interface{}, error) {
+	// 生成签名头部
+	headers, err := t.generateSignatureInterface(method, endpoint, params, data)
+	if err != nil {
+		return nil, fmt.Errorf("生成签名失败: %w", err)
+	}
+
+	// 构建完整URL
+	url := strings.TrimSuffix(t.baseURL, "/") + endpoint
+
+	// 创建请求
+	var req *http.Request
+	method = strings.ToUpper(method)
+
+	if method == "GET" || method == "DELETE" {
+		// GET/DELETE请求，参数放在URL中
+		if len(params) > 0 {
+			queryParams := make([]string, 0, len(params))
+			for k, v := range params {
+				if v != "" {
+					queryParams = append(queryParams, fmt.Sprintf("%s=%s", k, v))
+				}
+			}
+			if len(queryParams) > 0 {
+				url += "?" + strings.Join(queryParams, "&")
+			}
+		}
+		// DELETE 请求需要空 body
+		var body io.Reader
+		if method == "DELETE" {
+			body = strings.NewReader("{}")
+		}
+		req, err = http.NewRequest(method, url, body)
+	} else if method == "POST" || method == "PUT" {
+		// POST/PUT请求，参数放在请求体中
 		var body io.Reader
 		if len(data) > 0 {
 			jsonData, err := json.Marshal(data)
@@ -821,7 +1012,8 @@ func (t *BackpackTrader) CancelAllOrders(symbol string) error {
 		"symbol": backpackSymbol,
 	}
 
-	_, err := t.makeAuthenticatedRequest("DELETE", "/api/v1/orders", params, nil)
+	// ✅ 修复：DELETE请求需要传递空的data参数而不是nil
+	_, err := t.makeAuthenticatedRequest("DELETE", "/api/v1/orders", params, map[string]string{})
 	if err != nil {
 		return fmt.Errorf("取消所有订单失败: %w", err)
 	}
@@ -830,20 +1022,116 @@ func (t *BackpackTrader) CancelAllOrders(symbol string) error {
 	return nil
 }
 
+// GetOpenOrders 查询未成交订单
+func (t *BackpackTrader) GetOpenOrders(symbol string) ([]map[string]interface{}, error) {
+	backpackSymbol := t.mapSymbol(symbol)
+	log.Printf("📋 [Backpack] 查询未成交订单: %s", backpackSymbol)
+
+	params := map[string]string{
+		"symbol": backpackSymbol,
+	}
+
+	ordersData, err := t.makeAuthenticatedRequestArray("GET", "/api/v1/orders", params, nil)
+	if err != nil {
+		return nil, fmt.Errorf("查询订单失败: %w", err)
+	}
+
+	orders := make([]map[string]interface{}, 0)
+	for _, item := range ordersData {
+		if order, ok := item.(map[string]interface{}); ok {
+			orders = append(orders, order)
+		}
+	}
+
+	log.Printf("✓ [Backpack] 找到 %d 个未成交订单", len(orders))
+	return orders, nil
+}
+
+// CancelOrder 取消单个订单
+func (t *BackpackTrader) CancelOrder(symbol, orderID string) error {
+	backpackSymbol := t.mapSymbol(symbol)
+	log.Printf("🗑️ [Backpack] 取消订单: %s (ID: %s)", backpackSymbol, orderID)
+
+	params := map[string]string{
+		"symbol":  backpackSymbol,
+		"orderId": orderID,
+	}
+
+	_, err := t.makeAuthenticatedRequest("DELETE", "/api/v1/order", params, map[string]string{})
+	if err != nil {
+		return fmt.Errorf("取消订单失败: %w", err)
+	}
+
+	log.Printf("✓ [Backpack] 订单已取消")
+	return nil
+}
+
 // CancelStopLossOrders 取消止损订单
 func (t *BackpackTrader) CancelStopLossOrders(symbol string) error {
 	log.Printf("🗑️ [Backpack] 取消止损订单: %s", symbol)
-	// Backpack可能需要先查询止损订单，然后逐个取消
-	// 这里简化处理，取消所有订单
-	return t.CancelAllOrders(symbol)
+
+	// ✅ 查询所有未成交订单
+	orders, err := t.GetOpenOrders(symbol)
+	if err != nil {
+		return fmt.Errorf("查询订单失败: %w", err)
+	}
+
+	// ✅ 识别并取消止损订单（有stopLossTriggerPrice字段的订单）
+	cancelCount := 0
+	for _, order := range orders {
+		// 检查是否有止损触发价格字段
+		if _, hasStopLoss := order["stopLossTriggerPrice"]; hasStopLoss {
+			orderID, ok := order["id"].(string)
+			if !ok {
+				log.Printf("  ⚠️ 订单ID格式错误，跳过")
+				continue
+			}
+
+			// 取消这个止损订单
+			if err := t.CancelOrder(symbol, orderID); err != nil {
+				log.Printf("  ⚠️ 取消止损订单 %s 失败: %v", orderID, err)
+			} else {
+				cancelCount++
+			}
+		}
+	}
+
+	log.Printf("✓ [Backpack] 已取消 %d 个止损订单", cancelCount)
+	return nil
 }
 
 // CancelTakeProfitOrders 取消止盈订单
 func (t *BackpackTrader) CancelTakeProfitOrders(symbol string) error {
 	log.Printf("🗑️ [Backpack] 取消止盈订单: %s", symbol)
-	// Backpack可能需要先查询止盈订单，然后逐个取消
-	// 这里简化处理，取消所有订单
-	return t.CancelAllOrders(symbol)
+
+	// ✅ 查询所有未成交订单
+	orders, err := t.GetOpenOrders(symbol)
+	if err != nil {
+		return fmt.Errorf("查询订单失败: %w", err)
+	}
+
+	// ✅ 识别并取消止盈订单（有takeProfitTriggerPrice字段的订单）
+	cancelCount := 0
+	for _, order := range orders {
+		// 检查是否有止盈触发价格字段
+		if _, hasTakeProfit := order["takeProfitTriggerPrice"]; hasTakeProfit {
+			orderID, ok := order["id"].(string)
+			if !ok {
+				log.Printf("  ⚠️ 订单ID格式错误，跳过")
+				continue
+			}
+
+			// 取消这个止盈订单
+			if err := t.CancelOrder(symbol, orderID); err != nil {
+				log.Printf("  ⚠️ 取消止盈订单 %s 失败: %v", orderID, err)
+			} else {
+				cancelCount++
+			}
+		}
+	}
+
+	log.Printf("✓ [Backpack] 已取消 %d 个止盈订单", cancelCount)
+	return nil
 }
 
 // CancelStopOrders 取消止损止盈订单
@@ -865,26 +1153,39 @@ func (t *BackpackTrader) SetStopLoss(symbol string, positionSide string, quantit
 		side = "Bid" // 空仓止损 = 买入
 	}
 
-	// ⚠️ Backpack 注意事项：
-	// Backpack 的真正止损应该在开仓时通过 stopLossTriggerPrice 参数设置
-	// 这里作为事后设置，我们使用 Limit 订单挂在止损价格
-	// 虽然不是触发式止损，但可以在价格到达时自动成交
+	// ✅ 使用触发式止损订单 + reduceOnly 防止反向开仓
+	// stopLossTriggerPrice: 触发价格（当市场价格触及此价格时触发订单）
+	// stopLossLimitPrice: 限价价格（触发后以此价格或更优价格成交）
+	// reduceOnly: true - 关键！确保只减仓不开反向仓位
 	qtyStr, _ := t.FormatQuantity(backpackSymbol, quantity)
-	data := map[string]string{
-		"symbol":    backpackSymbol,
-		"side":      side,
-		"orderType": "Limit",  // 使用 Limit 而不是 StopMarket
-		"quantity":  qtyStr,
-		"price":     formatFloat(stopPrice, 2),
-		"timeInForce": "GTC",  // Good Till Cancel
+
+	// 对于止损，限价价格通常比触发价格稍差一点，以确保成交
+	// 多仓止损: 限价略低于触发价 (避免滑点导致无法成交)
+	// 空仓止损: 限价略高于触发价
+	limitPrice := stopPrice
+	if positionSide == "long" || positionSide == "LONG" {
+		limitPrice = stopPrice * 0.999 // 限价比触发价低0.1%
+	} else {
+		limitPrice = stopPrice * 1.001 // 限价比触发价高0.1%
 	}
 
-	_, err := t.makeAuthenticatedRequest("POST", "/api/v1/order", nil, data)
+	data := map[string]interface{}{
+		"symbol":               backpackSymbol,
+		"side":                 side,
+		"orderType":            "Limit",
+		"quantity":             qtyStr,
+		"price":                formatFloat(limitPrice, 2),     // ✅ 必需字段：限价价格
+		"stopLossTriggerPrice": formatFloat(stopPrice, 2),      // 触发价格
+		"stopLossLimitPrice":   formatFloat(limitPrice, 2),     // 限价价格
+		"reduceOnly":           true,                            // ✅ 布尔值，防止反向开仓
+	}
+
+	_, err := t.makeAuthenticatedRequestInterface("POST", "/api/v1/order", nil, data)
 	if err != nil {
 		return fmt.Errorf("设置止损失败: %w", err)
 	}
 
-	log.Printf("✓ [Backpack] 止损已设置（使用Limit订单）")
+	log.Printf("✓ [Backpack] 止损已设置（触发价: %.2f, 限价: %.2f, reduceOnly: true）", stopPrice, limitPrice)
 	return nil
 }
 
@@ -901,23 +1202,39 @@ func (t *BackpackTrader) SetTakeProfit(symbol string, positionSide string, quant
 		side = "Bid" // 空仓止盈 = 买入
 	}
 
-	// 创建限价止盈订单
+	// ✅ 使用触发式止盈订单 + reduceOnly 防止反向开仓
+	// takeProfitTriggerPrice: 触发价格（当市场价格触及此价格时触发订单）
+	// takeProfitLimitPrice: 限价价格（触发后以此价格或更优价格成交）
+	// reduceOnly: true - 关键！确保只减仓不开反向仓位
 	qtyStr, _ := t.FormatQuantity(backpackSymbol, quantity)
-	data := map[string]string{
-		"symbol":      backpackSymbol,
-		"side":        side,
-		"orderType":   "Limit",
-		"quantity":    qtyStr,
-		"price":       formatFloat(takeProfitPrice, 2),
-		"timeInForce": "GTC",  // Good Till Cancel
+
+	// 对于止盈，限价价格通常比触发价格稍差一点，以确保成交
+	// 多仓止盈: 限价略低于触发价 (确保能卖出)
+	// 空仓止盈: 限价略高于触发价 (确保能买入)
+	limitPrice := takeProfitPrice
+	if positionSide == "long" || positionSide == "LONG" {
+		limitPrice = takeProfitPrice * 0.999 // 限价比触发价低0.1%
+	} else {
+		limitPrice = takeProfitPrice * 1.001 // 限价比触发价高0.1%
 	}
 
-	_, err := t.makeAuthenticatedRequest("POST", "/api/v1/order", nil, data)
+	data := map[string]interface{}{
+		"symbol":                  backpackSymbol,
+		"side":                    side,
+		"orderType":               "Limit",
+		"quantity":                qtyStr,
+		"price":                   formatFloat(limitPrice, 2),        // ✅ 必需字段：限价价格
+		"takeProfitTriggerPrice":  formatFloat(takeProfitPrice, 2),  // 触发价格
+		"takeProfitLimitPrice":    formatFloat(limitPrice, 2),       // 限价价格
+		"reduceOnly":              true,                              // ✅ 布尔值，防止反向开仓
+	}
+
+	_, err := t.makeAuthenticatedRequestInterface("POST", "/api/v1/order", nil, data)
 	if err != nil {
 		return fmt.Errorf("设置止盈失败: %w", err)
 	}
 
-	log.Printf("✓ [Backpack] 止盈已设置（使用Limit订单）")
+	log.Printf("✓ [Backpack] 止盈已设置（触发价: %.2f, 限价: %.2f, reduceOnly: true）", takeProfitPrice, limitPrice)
 	return nil
 }
 

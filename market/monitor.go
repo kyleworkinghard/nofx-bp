@@ -249,7 +249,8 @@ func (m *WSMonitor) GetCurrentKlines(symbol string, duration string) ([]Kline, e
 		// 订阅 WebSocket 流
 		subStr := m.subscribeSymbol(symbol, duration)
 		subErr := m.combinedClient.subscribeStreams(subStr)
-		log.Printf("动态订阅流: %v", subStr)
+		// 减少日志噪音：动态订阅流日志已移除
+		// log.Printf("动态订阅流: %v", subStr)
 		if subErr != nil {
 			log.Printf("警告: 动态订阅%v分钟K线失败: %v (使用API数据)", duration, subErr)
 		}

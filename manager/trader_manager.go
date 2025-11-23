@@ -224,8 +224,9 @@ func (tm *TraderManager) addTraderFromDB(traderCfg *config.TraderRecord, aiModel
 		HyperliquidTestnet:    exchangeCfg.Testnet,
 		CoinPoolAPIURL:        effectiveCoinPoolURL,
 		UseQwen:               aiModelCfg.Provider == "qwen",
-		DeepSeekKey:           "",
-		QwenKey:               "",
+		DeepSeekKey:           aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (DeepSeek)
+		QwenKey:               aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (Qwen)
+		CustomAPIKey:          aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (Claude/Gemini/Custom)
 		CustomAPIURL:          aiModelCfg.CustomAPIURL,    // 自定义API URL
 		CustomModelName:       aiModelCfg.CustomModelName, // 自定义模型名称
 		ScanInterval:          time.Duration(traderCfg.ScanIntervalMinutes) * time.Minute,
@@ -334,8 +335,9 @@ func (tm *TraderManager) AddTraderFromDB(traderCfg *config.TraderRecord, aiModel
 		HyperliquidTestnet:    exchangeCfg.Testnet,
 		CoinPoolAPIURL:        effectiveCoinPoolURL,
 		UseQwen:               aiModelCfg.Provider == "qwen",
-		DeepSeekKey:           "",
-		QwenKey:               "",
+		DeepSeekKey:           aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (DeepSeek)
+		QwenKey:               aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (Qwen)
+		CustomAPIKey:          aiModelCfg.APIKey,          // ✅ 从数据库读取 AI API Key (Claude/Gemini/Custom)
 		CustomAPIURL:          aiModelCfg.CustomAPIURL,    // 自定义API URL
 		CustomModelName:       aiModelCfg.CustomModelName, // 自定义模型名称
 		ScanInterval:          time.Duration(traderCfg.ScanIntervalMinutes) * time.Minute,

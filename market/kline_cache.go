@@ -84,8 +84,8 @@ func (kc *KlineCache) InitSymbol(symbol string, maxKlines int) error {
 		Data:   make(map[TimeFrame][]Kline),
 	}
 
-	// 为每个时间周期获取初始K线数据
-	timeFrames := []TimeFrame{TimeFrame5m, TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h, TimeFrame1d}
+	// 为每个时间周期获取初始K线数据（已移除5m，准确率太低）
+	timeFrames := []TimeFrame{TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h, TimeFrame1d}
 
 	for _, tf := range timeFrames {
 		interval := BinanceIntervalMap[tf]
@@ -118,8 +118,8 @@ func (kc *KlineCache) UpdateSymbol(symbol string) error {
 	mtk.mu.Lock()
 	defer mtk.mu.Unlock()
 
-	// 更新每个时间周期的K线数据
-	timeFrames := []TimeFrame{TimeFrame5m, TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h, TimeFrame1d}
+	// 更新每个时间周期的K线数据（已移除5m，准确率太低）
+	timeFrames := []TimeFrame{TimeFrame15m, TimeFrame30m, TimeFrame1h, TimeFrame4h, TimeFrame1d}
 
 	for _, tf := range timeFrames {
 		interval := BinanceIntervalMap[tf]
@@ -146,13 +146,37 @@ func (kc *KlineCache) UpdateSymbol(symbol string) error {
 		lastNew := newKlines[len(newKlines)-1]
 
 		if lastNew.OpenTime > lastExisting.OpenTime {
-			// 新K线已生成，追加到数组
-			mtk.Data[tf] = append(existingKlines, newKlines...)
-			log.Printf("🔄 [KlineCache] %s %s: 新增K线 (时间: %s)",
-				symbol, tf, time.UnixMilli(lastNew.OpenTime).Format("15:04"))
-		} else {
+			// 新K线已生成
+			// 1. 先替换最后一根K线为已完成的版本（避免重复）
+			// 2. 然后只追加真正新的K线
+			for _, newKline := range newKlines {
+				if newKline.OpenTime == lastExisting.OpenTime {
+					// 更新现有K线为完成版本
+					existingKlines[len(existingKlines)-1] = newKline
+					log.Printf("🔄 [KlineCache] %s %s: 完成K线 (时间: %s)",
+						symbol, tf, time.UnixMilli(newKline.OpenTime).Format("15:04"))
+				} else if newKline.OpenTime > lastExisting.OpenTime {
+					// 追加新K线
+					existingKlines = append(existingKlines, newKline)
+					log.Printf("🔄 [KlineCache] %s %s: 新增K线 (时间: %s)",
+						symbol, tf, time.UnixMilli(newKline.OpenTime).Format("15:04"))
+				}
+			}
+			mtk.Data[tf] = existingKlines
+		} else if lastNew.OpenTime == lastExisting.OpenTime {
 			// 更新最后一根K线（仍在形成中）
 			existingKlines[len(existingKlines)-1] = lastNew
+			// 只在关键周期打印更新日志
+			if tf == TimeFrame15m || tf == TimeFrame30m || tf == TimeFrame1h {
+				log.Printf("🔄 [KlineCache] %s %s: 更新K线 (时间: %s, 价格: %.4f)",
+					symbol, tf, time.UnixMilli(lastNew.OpenTime).Format("15:04"), lastNew.Close)
+			}
+		} else {
+			// 异常情况：新K线时间早于现有K线
+			log.Printf("⚠️ [KlineCache] %s %s: 时间异常 (新: %s < 现有: %s)",
+				symbol, tf,
+				time.UnixMilli(lastNew.OpenTime).Format("15:04"),
+				time.UnixMilli(lastExisting.OpenTime).Format("15:04"))
 		}
 
 		// 保持K线数量不超过限制（保留最新的20根）
@@ -183,12 +207,18 @@ func (kc *KlineCache) GetKlines(symbol string, timeFrame TimeFrame, limit int) (
 		return nil, fmt.Errorf("timeframe %s not found for %s", timeFrame, symbol)
 	}
 
-	// 返回最新的limit根K线
+	// ✅ FIX: 返回深拷贝而非引用，避免并发竞态条件导致形态检测数据错误
+	var result []Kline
 	if len(klines) <= limit {
-		return klines, nil
+		result = make([]Kline, len(klines))
+		copy(result, klines)
+	} else {
+		sourceSlice := klines[len(klines)-limit:]
+		result = make([]Kline, len(sourceSlice))
+		copy(result, sourceSlice)
 	}
 
-	return klines[len(klines)-limit:], nil
+	return result, nil
 }
 
 // GetLatestKline 获取最新的一根K线

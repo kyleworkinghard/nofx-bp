@@ -106,7 +106,8 @@ func (c *CombinedStreamsClient) subscribeStreams(streams []string) error {
 		return fmt.Errorf("WebSocket未连接")
 	}
 
-	log.Printf("订阅流: %v", streams)
+	// 减少日志噪音：订阅流日志已移除
+	// log.Printf("订阅流: %v", streams)
 	return c.conn.WriteJSON(subscribeMsg)
 }
 

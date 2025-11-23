@@ -283,11 +283,13 @@ func (d *Database) initDefaultData() error {
 	}{
 		{"deepseek", "DeepSeek", "deepseek"},
 		{"qwen", "Qwen", "qwen"},
+		{"claude", "Claude (Anthropic)", "claude"},
+		{"gemini", "Gemini (Google)", "gemini"},
 	}
 
 	for _, model := range aiModels {
 		_, err := d.db.Exec(`
-			INSERT OR IGNORE INTO ai_models (id, user_id, name, provider, enabled) 
+			INSERT OR IGNORE INTO ai_models (id, user_id, name, provider, enabled)
 			VALUES (?, 'default', ?, ?, 0)
 		`, model.id, model.name, model.provider)
 		if err != nil {
