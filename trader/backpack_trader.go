@@ -1052,8 +1052,8 @@ func (t *BackpackTrader) CancelOrder(symbol, orderID string) error {
 	backpackSymbol := t.mapSymbol(symbol)
 	log.Printf("🗑️ [Backpack] 取消订单: %s (ID: %s)", backpackSymbol, orderID)
 
+	// ✅ 根据 Backpack API 文档，orderCancel 只需要 orderId，不需要 symbol
 	params := map[string]string{
-		"symbol":  backpackSymbol,
 		"orderId": orderID,
 	}
 

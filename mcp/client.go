@@ -51,7 +51,7 @@ func New() *Client {
 	return &Client{
 		Provider:  ProviderDeepSeek,
 		BaseURL:   "https://api.deepseek.com/v1",
-		Model:     "deepseek-chat",
+		Model:     "deepseek-reasoner",
 		Timeout:   120 * time.Second, // 增加到120秒，因为AI需要分析大量数据
 		MaxTokens: maxTokens,
 	}

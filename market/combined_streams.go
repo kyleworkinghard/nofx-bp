@@ -99,8 +99,9 @@ func (c *CombinedStreamsClient) subscribeStreams(streams []string) error {
 		"id":     time.Now().UnixNano(),
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	// 使用写锁保护 WebSocket 写操作（防止并发写入导致 panic）
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if c.conn == nil {
 		return fmt.Errorf("WebSocket未连接")
